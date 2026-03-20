@@ -1,0 +1,11 @@
+# Polymarket Bot — Python dependencies
+# Install with: pip install -r requirements.txt
+
+py-clob-client>=0.18.0     # Official Polymarket CLOB SDK
+web3>=6.0.0                # Ethereum / Polygon interaction
+aiohttp>=3.9.0             # Async HTTP (Gamma + Data APIs)
+websockets>=12.0           # Real-time price streaming
+eth-account>=0.10.0        # Wallet signing
+python-dotenv>=1.0.0       # Load .env config
+python-telegram-bot>=20.0  # Signal notifications + approval buttons
+rich>=13.0.0               # Terminal dashboard UI
