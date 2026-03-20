@@ -1,0 +1,42 @@
+[
+  {
+    "signal_id": "paper_0001",
+    "market_question": "Will Bitcoin dip to $65,000 in March?",
+    "token_id": "64087619211543545431479218048939484178441767712621033463416084593776314629222",
+    "side": "BUY",
+    "entry_price": 0.4225,
+    "fair_value_at_entry": 0.23898507383765952,
+    "edge_at_entry": 0.18351492616234047,
+    "size_usdc": 1.1238106613497532,
+    "size_tokens": 2.6599,
+    "size_fraction": 0.11238106613497532,
+    "entry_time": 1774014529.638322,
+    "neg_risk": false,
+    "current_price": 0.4225,
+    "exit_price": null,
+    "exit_time": null,
+    "resolved": false,
+    "won": null,
+    "days_to_expiry": 11.591092153819444
+  },
+  {
+    "signal_id": "paper_0002",
+    "market_question": "Will Bitcoin reach $80,000 in March?",
+    "token_id": "96839284769036407740491691016901048240322264125970194871307313464800669089139",
+    "side": "BUY",
+    "entry_price": 0.155,
+    "fair_value_at_entry": 0.10186930500008534,
+    "edge_at_entry": 0.05313069499991466,
+    "size_usdc": 0.28055981284507825,
+    "size_tokens": 1.8101,
+    "size_fraction": 0.028055981284507828,
+    "entry_time": 1774014529.646171,
+    "neg_risk": false,
+    "current_price": 0.155,
+    "exit_price": null,
+    "exit_time": null,
+    "resolved": false,
+    "won": null,
+    "days_to_expiry": 11.591092062280094
+  }
+]
