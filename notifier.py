@@ -11,6 +11,18 @@ from telegram.ext import Application, CallbackQueryHandler, ContextTypes
 
 log = logging.getLogger(__name__)
 
+_ESCAPE = str.maketrans({
+    "_": r"\_", "*": r"\*", "[": r"\[", "]": r"\]",
+    "(": r"\(", ")": r"\)", "~": r"\~", "`": r"\`",
+    ">": r"\>", "#": r"\#", "+": r"\+", "-": r"\-",
+    "=": r"\=", "|": r"\|", "{": r"\{", "}": r"\}",
+    ".": r"\.", "!": r"\!",
+})
+
+def _esc(text: str) -> str:
+    """Escape text for Telegram MarkdownV2."""
+    return str(text).translate(_ESCAPE)
+
 _APPROVAL_TIMEOUT = 600  # 10 minutes
 
 
@@ -83,7 +95,7 @@ class TelegramNotifier:
                 if held_outcome == "YES" else "market overpricing this outcome")
         msg = (
             f"{self._tag()}🟢 *Trade Entered*\n\n"
-            f"*{market[:70]}*\n\n"
+            f"*{_esc(market[:70])}*\n\n"
             f"*Bought:* {held_outcome} token\n"
             f"*Why:* Model {fair_value*100:.1f}% vs market {entry_price*100:.1f}% — {desc}\n\n"
             f"*Entry:* `{entry_price:.4f}` ({entry_price*100:.1f}%)\n"
@@ -104,7 +116,7 @@ class TelegramNotifier:
         sign = "+" if pnl >= 0 else ""
         msg = (
             f"{self._tag()}🔴 *Stop-Loss Triggered*\n\n"
-            f"*{market[:70]}*\n\n"
+            f"*{_esc(market[:70])}*\n\n"
             f"*Held:* {held_outcome}  *Why:* {reason}\n\n"
             f"*Entry:* `{entry_price:.4f}`  *Exit:* `{exit_price:.4f}`\n"
             f"*Fair now:* `{fair_value_now:.4f}`\n\n"
@@ -122,7 +134,7 @@ class TelegramNotifier:
         sign = "+" if pnl >= 0 else ""
         msg = (
             f"{self._tag()}✅ *Take-Profit Triggered*\n\n"
-            f"*{market[:70]}*\n\n"
+            f"*{_esc(market[:70])}*\n\n"
             f"*Held:* {held_outcome}\n"
             f"*Why:* Edge decayed from {edge_at_entry*100:.1f}pp to {edge_now*100:.1f}pp\n\n"
             f"*Entry:* `{entry_price:.4f}`  *Exit:* `{exit_price:.4f}`\n"
@@ -138,10 +150,11 @@ class TelegramNotifier:
         price_to: float, window_seconds: float, open_positions: int,
     ) -> None:
         direction = "surged" if move_pct > 0 else "dropped"
+        pos_text  = f"{open_positions} {asset} position{'s' if open_positions != 1 else ''}"
         msg = (
-            f"{self._tag()}🚨 *{asset} {direction} {move_pct*100:+.2f}%*\n\n"
+            f"{self._tag()}⚡ *{asset} {direction} {move_pct*100:+.2f}%*\n"
             f"`${price_from:,.0f}` → `${price_to:,.0f}` in `{window_seconds:.0f}s`\n"
-            f"Checking `{open_positions}` open position(s)..."
+            f"Re-evaluating {pos_text} for TP/SL exits."
         )
         await self.send(msg)
 
@@ -170,12 +183,13 @@ class TelegramNotifier:
             lines.append(f"\n*Closed today ({len(closed_today)}):*")
             for p in closed_today[:8]:
                 pnl, sign = p.get("pnl", 0), "+" if p.get("pnl", 0) >= 0 else ""
-                lines.append(f"{'✅' if pnl>=0 else '❌'} {p['market'][:45]}... `{sign}${pnl:.2f}` {p.get('reason','')}")
+                icon = "\u2705" if pnl >= 0 else "\u274c"
+                lines.append(f"{icon} {_esc(p['market'][:45])}... `{sign}${pnl:.2f}` {p.get('reason','')}")
         if open_positions:
             lines.append(f"\n*Open ({len(open_positions)}):*")
             for p in open_positions[:8]:
                 upnl, sign = p.get("unrealised_pnl", 0), "+" if p.get("unrealised_pnl", 0) >= 0 else ""
-                lines.append(f"• {p['market'][:45]}... uP&L `{sign}${upnl:.2f}`")
+                lines.append(f"\u2022 {_esc(p['market'][:45])}... uP&L `{sign}${upnl:.2f}`")
         else:
             lines.append("\n_No open positions_")
         await self.send("\n".join(lines))

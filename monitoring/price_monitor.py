@@ -17,7 +17,7 @@ _ASSETS          = ("BTC", "ETH", "SOL", "XRP", "BNB")
 _MOVE_THRESHOLD  = 0.005   # 0.5% triggers re-evaluation
 _SPIKE_THRESHOLD = 0.020   # 2.0% triggers urgent Telegram alert
 _WINDOW_SECONDS  = 60
-_COOLDOWN        = 30.0    # seconds between alerts per asset
+_COOLDOWN        = 300.0   # 5 minutes between alerts per asset
 _POLL_INTERVAL   = 1.0
 
 
