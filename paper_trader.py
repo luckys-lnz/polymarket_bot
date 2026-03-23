@@ -187,13 +187,30 @@ class PaperLedger:
 
     def update_prices(self, price_map: dict[str, float]) -> None:
         """
-        Update current mark prices for open trades.
+        Update current mark prices for open trades and auto-resolve
+        any positions whose market has expired (price converged to 0 or 1).
         price_map: {market_question: current_yes_price}
         """
+        from datetime import datetime, timezone as _tz
+        now = time.time()
+
         for trade in self.open_trades:
-            if trade.market_question in price_map:
-                trade.current_price = price_map[trade.market_question]
-        if self.open_trades:
+            if trade.market_question not in price_map:
+                continue
+
+            new_price = price_map[trade.market_question]
+            trade.current_price = new_price
+
+            # Auto-resolve: if price has converged to near 0 or near 1,
+            # the market has effectively resolved. Treat as settled.
+            if new_price >= 0.97:
+                self.close_trade(trade, exit_price=1.0, won=True)
+                log.info("AUTO-RESOLVED ✓ %s → YES (price=%.3f)", trade.signal_id, new_price)
+            elif new_price <= 0.03:
+                self.close_trade(trade, exit_price=0.0, won=False)
+                log.info("AUTO-RESOLVED ✗ %s → NO (price=%.3f)", trade.signal_id, new_price)
+
+        if self.open_trades or self.closed_trades:
             self._persist()
 
     def close_trade(self, trade: PaperTrade, exit_price: float, won: bool) -> None:
@@ -207,6 +224,96 @@ class PaperLedger:
             trade.signal_id, exit_price, trade.entry_price,
             trade.realised_pnl, trade.return_pct,
         )
+        self._persist()
+
+    def manual_exit(self, signal_id: str, reason: str = "manual") -> Optional[PaperTrade]:
+        """
+        Manually close a position by signal_id at current mark price.
+        Used by the CLI commands: stop <id> and tp <id>.
+        Returns the closed trade or None if not found.
+        """
+        trade = next((t for t in self.open_trades if t.signal_id == signal_id), None)
+        if trade is None:
+            log.warning("No open trade found with id: %s", signal_id)
+            return None
+
+        exit_price = trade.current_price if trade.current_price > 0 else trade.entry_price
+        won        = exit_price > trade.entry_price
+        self.close_trade(trade, exit_price=exit_price, won=won)
+
+        pnl  = trade.realised_pnl
+        sign = "+" if pnl >= 0 else ""
+        log.info(
+            "🖐  MANUAL EXIT [%s] #%s %s | exit=%.4f | P&L=$%s%.2f (%.1f%%)",
+            reason.upper(), signal_id,
+            trade.market_question[:45],
+            exit_price, sign, pnl, trade.return_pct,
+        )
+        return trade
+
+    def list_open(self) -> None:
+        """Print all open positions with current mark and unrealised P&L."""
+        if not self.open_trades:
+            print("  No open positions.")
+            return
+        header = f"  {'ID':<12} {'Outcome':<6} {'Entry':>7} {'Mark':>7} {'uPnL':>8}  Market"
+        print("\n" + header)
+        print(f"  {'-'*12} {'-'*6} {'-'*7} {'-'*7} {'-'*8}  {'-'*40}")
+        for t in self.open_trades:
+            mark = t.current_price if t.current_price > 0 else t.entry_price
+            pnl  = t.unrealised_pnl
+            sign = "+" if pnl >= 0 else ""
+            print(
+                f"  {t.signal_id:<12} {t.held_outcome:<6} "
+                f"{t.entry_price:>7.4f} {mark:>7.4f} "
+                f"${sign}{pnl:>6.2f}  {t.market_question[:45]}"
+            )
+        print()
+
+    def load_from_file(self, path: str = "paper_trades.json") -> None:
+        """
+        Reload trades from a previous session's paper_trades.json.
+        Call this at startup to resume tracking across process restarts.
+        """
+        import json as _json
+        if not os.path.exists(path):
+            log.info("No existing paper_trades.json — starting fresh")
+            return
+        try:
+            with open(path) as f:
+                records = _json.load(f)
+            for r in records:
+                trade = PaperTrade(
+                    signal_id           = r["signal_id"],
+                    market_question     = r["market_question"],
+                    token_id            = r["token_id"],
+                    side                = r["side"],
+                    entry_price         = r["entry_price"],
+                    fair_value_at_entry = r["fair_value_at_entry"],
+                    edge_at_entry       = r["edge_at_entry"],
+                    size_usdc           = r["size_usdc"],
+                    size_tokens         = r["size_tokens"],
+                    entry_time          = r["entry_time"],
+                    neg_risk            = r["neg_risk"],
+                    size_fraction       = r.get("size_fraction", 0.0),
+                    days_to_expiry      = r.get("days_to_expiry", 0.0),
+                    current_price       = r.get("current_price", r["entry_price"]),
+                    exit_price          = r.get("exit_price"),
+                    exit_time           = r.get("exit_time"),
+                    resolved            = r.get("resolved", False),
+                    won                 = r.get("won"),
+                )
+                self.trades.append(trade)
+                self._seen_markets.add(trade.market_question)
+                if self._trade_counter < int(r["signal_id"].split("_")[-1]):
+                    self._trade_counter = int(r["signal_id"].split("_")[-1])
+            log.info("Loaded %d trades from %s (%d open, %d closed)",
+                     len(records),
+                     path,
+                     len([t for t in self.trades if not t.resolved]),
+                     len([t for t in self.trades if t.resolved]))
+        except Exception as e:
+            log.warning("Could not load paper_trades.json: %s — starting fresh", e)
 
     def _persist(self, path: str = "paper_trades.json") -> None:
         """Write all trades to JSON so the dashboard can read them."""
@@ -407,9 +514,10 @@ class PaperTrader:
 
     async def run_once(self) -> None:
         """Run a single scan and print the full summary."""
+        self._ledger.load_from_file()   # resume prior session if available
         log.info("Starting Binance feed...")
         feed_task = asyncio.create_task(self._spot_feed.start())
-        await asyncio.sleep(3)   # wait for first prices
+        await asyncio.sleep(3)
 
         await self._scan_once()
         self._ledger.print_summary()
@@ -419,8 +527,10 @@ class PaperTrader:
     async def run_loop(self, interval_seconds: int = 3600) -> None:
         """
         Run continuously, scanning every `interval_seconds`.
+        Resumes prior trades from paper_trades.json on startup.
         Prints summary after each scan and on Ctrl+C.
         """
+        self._ledger.load_from_file()   # resume prior session
         log.info("Starting Binance feed...")
         feed_task = asyncio.create_task(self._spot_feed.start())
         await asyncio.sleep(3)
@@ -431,18 +541,76 @@ class PaperTrader:
         )
 
         scan_count = 0
+        cli_task   = asyncio.create_task(self._cli_listener())
         try:
             while True:
                 scan_count += 1
                 log.info("─── Scan #%d ───", scan_count)
                 await self._scan_once()
-                log.info("Next scan in %d minutes...", interval_seconds // 60)
+                log.info("Next scan in %d minutes... (type 'help' for commands)", interval_seconds // 60)
                 await asyncio.sleep(interval_seconds)
         except asyncio.CancelledError:
             pass
         finally:
+            cli_task.cancel()
             feed_task.cancel()
             self._ledger.print_summary()
+
+    async def _cli_listener(self) -> None:
+        """
+        Async CLI running alongside the scan loop.
+        Reads commands from stdin without blocking the event loop.
+
+        Commands:
+            list            — show all open positions
+            stop <id>       — exit position at current mark (stop-loss)
+            tp <id>         — take profit at current mark
+            summary         — print full P&L summary
+            help            — show this help
+        """
+        loop = asyncio.get_event_loop()
+        print("\n  Paper trader running. Commands: list | stop <id> | tp <id> | summary | help\n")
+        while True:
+            try:
+                # Read input without blocking the event loop
+                raw = await loop.run_in_executor(None, input, "  > ")
+                parts = raw.strip().split()
+                if not parts:
+                    continue
+                cmd = parts[0].lower()
+
+                if cmd == "help":
+                    print(
+                        "  Commands:\n"
+                        "    list            — show open positions\n"
+                        "    stop <id>       — exit at current mark (records as stop-loss)\n"
+                        "    tp <id>         — take profit at current mark\n"
+                        "    summary         — full P&L summary\n"
+                        "    help            — this message\n"
+                    )
+
+                elif cmd == "list":
+                    self._ledger.list_open()
+
+                elif cmd in ("stop", "tp") and len(parts) >= 2:
+                    signal_id = parts[1] if parts[1].startswith("paper_") else f"paper_{parts[1].zfill(4)}"
+                    reason    = "stop_loss" if cmd == "stop" else "take_profit"
+                    trade     = self._ledger.manual_exit(signal_id, reason=reason)
+                    if trade is None:
+                        print(f"  ✗ No open trade with id '{signal_id}'. Type 'list' to see open positions.")
+
+                elif cmd == "summary":
+                    self._ledger.print_summary()
+
+                else:
+                    print(f"  Unknown command: '{raw}'. Type 'help' for available commands.")
+
+            except asyncio.CancelledError:
+                break
+            except EOFError:
+                break
+            except Exception as exc:
+                log.debug("CLI error: %s", exc)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
