@@ -18,9 +18,10 @@ class Config:
     data_url:  str   = "https://data-api.polymarket.com"
     ws_url:    str   = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
+    starting_bankroll: float = 500.0   # total USDC available to the bot
     max_position_usdc: float = 50.0
     max_order_usdc:    float = 10.0
-    min_liquidity:     float = 500.0
+    min_liquidity:     float = 200.0  # minimum 24h volume for a market to be considered
 
     @classmethod
     def from_env(cls) -> Config:
@@ -29,10 +30,12 @@ class Config:
         if missing:
             raise EnvironmentError(f"Missing env vars: {', '.join(missing)}")
         return cls(
-            private_key    = os.environ["PRIVATE_KEY"],
-            api_key        = os.environ["API_KEY"],
-            api_secret     = os.environ["API_SECRET"],
-            api_passphrase = os.environ["API_PASSPHRASE"],
+            private_key       = os.environ["PRIVATE_KEY"],
+            api_key           = os.environ["API_KEY"],
+            api_secret        = os.environ["API_SECRET"],
+            api_passphrase    = os.environ["API_PASSPHRASE"],
+            starting_bankroll = float(os.environ.get("STARTING_BANKROLL", "500.0")),
+            max_order_usdc    = float(os.environ.get("MAX_ORDER_USDC", "10.0")),
         )
 
     def with_overrides(self, **kwargs) -> Config:
