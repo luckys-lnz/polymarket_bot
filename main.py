@@ -75,6 +75,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Maximum order size in USDC, overrides config (default: from .env)",
     )
+    parser.add_argument(
+        "--min-volume",
+        type=float,
+        default=None,
+        help="Minimum 24h market volume to consider (default: from config, 500.0)",
+    )
     return parser
 
 
@@ -108,6 +114,8 @@ def main() -> None:
     cfg = Config.from_env()
     if args.max_order is not None:
         cfg = cfg.with_overrides(max_order_usdc=args.max_order)
+    if args.min_volume is not None:
+        cfg = cfg.with_overrides(min_liquidity=args.min_volume)
 
     if args.live:
         _print_live_warning(cfg, args)
