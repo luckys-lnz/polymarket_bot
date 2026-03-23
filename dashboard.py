@@ -139,7 +139,7 @@ def build_trades_table(trades: list[dict]) -> Table:
 
     table.add_column("#",           style="bright_black",  width=10,  no_wrap=True)
     table.add_column("Market",      style="white",         ratio=4,   no_wrap=False)
-    table.add_column("Side",        style="cyan",          width=5,   no_wrap=True)
+    table.add_column("Token",       style="cyan",          width=5,   no_wrap=True)
     table.add_column("Entry",       justify="right",       width=7,   no_wrap=True)
     table.add_column("Mark",        justify="right",       width=7,   no_wrap=True)
     table.add_column("Edge",        justify="right",       width=7,   no_wrap=True)
@@ -176,10 +176,12 @@ def build_trades_table(trades: list[dict]) -> Table:
         if len(question) > 55:
             question = question[:52] + "..."
 
+        held_outcome = t.get("held_outcome", "YES")
+
         table.add_row(
             t.get("signal_id", "—"),
             question,
-            t.get("side", "BUY"),
+            held_outcome,
             f"{entry:.3f}",
             Text(f"{mark:.3f}", style=pnl_colour(mark - entry)),
             Text(f"+{edge*100:.1f}pp", style=edge_colour(edge)),
@@ -217,9 +219,12 @@ def build_signal_log(trades: list[dict]) -> Table:
         fair      = t.get("fair_value_at_entry", 0)
         mkt       = t.get("entry_price", 0)
         edge      = t.get("edge_at_entry", 0)
-        # fair < mkt → market overpricing → we BUY NO (bearish on YES price)
-        # fair > mkt → market underpricing → we BUY YES (bullish on YES price)
-        buying_no  = fair < mkt
+        held_outcome = t.get("held_outcome")
+        if held_outcome in ("YES", "NO"):
+            buying_no = held_outcome == "NO"
+        else:
+            # Backward compatibility for older ledgers without held_outcome.
+            buying_no = fair < mkt
         direction  = "▼ BUY NO" if buying_no else "▲ BUY YES"
         dir_color  = "red" if buying_no else "bright_green"
         days       = t.get("days_to_expiry", 0)
