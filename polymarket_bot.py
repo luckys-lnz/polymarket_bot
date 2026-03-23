@@ -37,7 +37,9 @@ from py_clob_client.clob_types import ApiCreds, MarketOrderArgs, OrderArgs
 from py_clob_client.constants import POLYGON
 
 from strategy import BinanceFeed, CryptoStrategy, VolatilityFeed
-from notifier import TelegramNotifier, format_signal_message
+from price_monitor import PriceActionMonitor
+from position_registry import PositionRegistry, Position, AutoExitManager
+from notifier import TelegramNotifier
 
 load_dotenv()
 
@@ -370,6 +372,32 @@ class OrderManager:
         log.info("← Market order: %s", result)
         return result
 
+    def place_limit_order_tokens(
+        self,
+        *,
+        token_id: str,
+        side: str,
+        price: float,
+        size_tokens: float,
+        neg_risk: bool = False,
+    ) -> dict:
+        """
+        Submit a limit order sized in tokens rather than USDC.
+        Used by AutoExitManager for SELL orders where we know token count,
+        not the original USDC value.
+        """
+        size_tokens = round(size_tokens, 4)
+        log.info(
+            "→ LIMIT %s token=%s… price=%.4f size_tokens=%.4f",
+            side, token_id[:12], price, size_tokens,
+        )
+        result = self._client.create_and_post_order(
+            OrderArgs(token_id=token_id, price=price, size=size_tokens, side=side),
+            {"tickSize": "0.01", "negRisk": neg_risk},
+        )
+        log.info("← Order placed: %s", result)
+        return result
+
     def cancel_order(self, order_id: str) -> dict:
         log.info("Cancelling order %s", order_id)
         return self._client.cancel(order_id)
@@ -392,7 +420,7 @@ class PolymarketBot:
     then flip to True when you are ready to trade real money.
     """
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, *, min_edge: float = 0.05) -> None:
         self._cfg       = config
         self._gamma     = GammaClient(config.gamma_url)
         self._data      = DataClient(config.data_url)
@@ -403,7 +431,7 @@ class PolymarketBot:
         self._strategy  = CryptoStrategy(
             self._spot_feed,
             self._vol_feed,
-            min_edge           = 0.05,
+            min_edge           = min_edge,
             min_volume         = 500.0,
             max_kelly_fraction = 0.25,
         )
@@ -413,6 +441,24 @@ class PolymarketBot:
             if os.environ.get("TELEGRAM_TOKEN")
             else None
         )
+        # Position registry — persists token IDs for exit order routing
+        self._registry = PositionRegistry()
+        self._registry.load()
+
+        # Auto exit manager — places SELL orders on TP/SL and notifies Telegram
+        self._exit_mgr = AutoExitManager(
+            registry         = self._registry,
+            order_manager    = self._orders,
+            spot_feed        = self._spot_feed,
+            vol_feed         = self._vol_feed,
+            notifier         = self._notifier,
+            stop_loss_pct    = 0.70,   # exit if position lost 70% of value
+            take_profit_edge = 0.02,   # exit if edge decays below 2pp
+        )
+
+        # Price action monitor — triggers exit evaluation on Binance moves
+        self._price_monitor = PriceActionMonitor(self._spot_feed)
+        self._price_monitor.add_move_handler(self._on_price_move)
 
     async def _read_only_demo(self) -> None:
         """
@@ -465,24 +511,42 @@ class PolymarketBot:
 
     async def _trading_loop(self, *, scan_interval: float = 60.0) -> None:
         """
-        Periodic loop: scan markets → evaluate strategy → request approval → place orders.
-        Only active when trading_enabled=True.
+        The core autonomous loop:
+          1. Scans markets every scan_interval seconds
+          2. Evaluates each market with Black-Scholes
+          3. Places BUY orders when edge > threshold
+          4. Sends Telegram message for every entry
+          5. Skips markets already in position
 
-        If a Telegram notifier is configured, each signal is sent to your phone
-        with YES/NO buttons. Auto-trades after 10 minutes if no response.
-        If no notifier is configured, trades automatically without approval.
+        TP/SL exits are handled separately by AutoExitManager
+        which fires in real-time on Binance price moves.
         """
-        signal_counter = 0
+        _ASSET_KEYWORDS = {
+            "BTC": ["bitcoin", "btc"],
+            "ETH": ["ethereum", "eth"],
+            "SOL": ["solana", "sol"],
+            "XRP": ["xrp", "ripple"],
+            "BNB": ["bnb", "binance"],
+        }
+
+        def _extract_asset(question: str) -> str:
+            ql = question.lower()
+            for asset, keywords in _ASSET_KEYWORDS.items():
+                if any(k in ql for k in keywords):
+                    return asset
+            return "BTC"
 
         while True:
             try:
-                markets = await self._gamma.get_active_markets(
+                markets  = await self._gamma.get_active_markets(
                     limit=200, min_volume=self._cfg.min_liquidity
                 )
+                existing = await self._data.get_positions(self._orders.wallet)
 
-                # Avoid doubling up on existing positions
-                existing  = await self._data.get_positions(self._orders.wallet)
+                # Build set of markets we already have open positions in
+                # Use both the Data API titles AND the registry
                 active_qs = {p.market_title for p in existing}
+                active_qs |= {p.market_question for p in self._registry.open_positions}
 
                 for market in markets:
                     if market.question in active_qs:
@@ -492,35 +556,71 @@ class PolymarketBot:
                     if signal is None:
                         continue
 
-                    size_usdc = self._cfg.max_order_usdc * signal.size_fraction
-                    signal_counter += 1
-                    signal_id = f"sig_{signal_counter:04d}"
+                    size_usdc   = self._cfg.max_order_usdc * signal.size_fraction
+                    size_tokens = round(size_usdc / signal.market_price, 4)
+                    asset       = _extract_asset(signal.market_question)
+                    spot        = self._spot_feed.price(asset) or 0.0
 
-                    if self._notifier:
-                        # Send to Telegram — wait for approval or timeout
-                        approved = await self._notifier.request_approval(
-                            signal_id = signal_id,
-                            message   = format_signal_message(signal),
-                        )
-                        if not approved:
-                            log.info("Signal %s rejected by user — skipping", signal_id)
-                            continue
-                        log.info("Signal %s approved — placing order", signal_id)
-                    else:
-                        log.info("No notifier configured — auto-trading signal %s", signal_id)
-
-                    self._orders.place_limit_order(
-                        token_id  = signal.token_id,
-                        side      = signal.side,
-                        price     = signal.market_price,
-                        size_usdc = size_usdc,
-                        neg_risk  = signal.neg_risk,
+                    log.info(
+                        "SIGNAL  %-55s  %s  edge=+%.1fpp  size=$%.2f",
+                        signal.market_question[:55], signal.held_outcome,
+                        signal.edge * 100, size_usdc,
                     )
+
+                    # Place the order
+                    try:
+                        self._orders.place_limit_order(
+                            token_id  = signal.token_id,
+                            side      = signal.side,
+                            price     = signal.market_price,
+                            size_usdc = size_usdc,
+                            neg_risk  = signal.neg_risk,
+                        )
+                    except Exception as exc:
+                        log.error("Order placement failed: %s", exc)
+                        continue
+
+                    # Register position for TP/SL tracking
+                    self._registry.open(Position(
+                        market_question     = signal.market_question,
+                        token_id            = signal.token_id,
+                        held_outcome        = signal.held_outcome,
+                        side                = signal.side,
+                        entry_price         = signal.market_price,
+                        size_tokens         = size_tokens,
+                        size_usdc           = size_usdc,
+                        fair_value_at_entry = signal.fair_value,
+                        edge_at_entry       = signal.edge,
+                        neg_risk            = signal.neg_risk,
+                        entry_time          = __import__("time").time(),
+                        end_date            = market.end_date,
+                        asset               = asset,
+                    ))
+
+                    # Send Telegram entry notification — always, no approval gate
+                    if self._notifier:
+                        await self._notifier.send_entry_notification(
+                            market         = signal.market_question,
+                            held_outcome   = signal.held_outcome,
+                            entry_price    = signal.market_price,
+                            fair_value     = signal.fair_value,
+                            edge           = signal.edge,
+                            size_usdc      = size_usdc,
+                            size_tokens    = size_tokens,
+                            kelly_pct      = signal.size_fraction * 100,
+                            days_to_expiry = signal.days_to_expiry,
+                            spot_price     = spot,
+                            asset          = asset,
+                            stats          = self._registry.stats,
+                        )
+
+                    active_qs.add(signal.market_question)
 
             except Exception as exc:
                 log.error("Trading loop error: %s", exc, exc_info=True)
 
             await asyncio.sleep(scan_interval)
+
 
     async def _ws_monitor(self, token_ids: list[str]) -> None:
         """Log real-time best bid/ask for a set of tokens."""
@@ -533,16 +633,98 @@ class PolymarketBot:
                 best_a = asks[0]["price"] if asks else "—"
                 log.info("BOOK %s… bid=%s ask=%s", asset, best_b, best_a)
 
-    async def run(self, *, trading_enabled: bool = False) -> None:
+    async def _daily_summary_loop(self) -> None:
+        """
+        Sends a Telegram portfolio summary every morning at 8am UTC.
+        Shows open positions, closed trades from the last 24h,
+        realised P&L, unrealised P&L, and win rate.
+        """
+        import datetime as dt
+        while True:
+            now = dt.datetime.now(dt.timezone.utc)
+            # Calculate seconds until next 8am UTC
+            next_8am = now.replace(hour=8, minute=0, second=0, microsecond=0)
+            if now >= next_8am:
+                next_8am += dt.timedelta(days=1)
+            wait_secs = (next_8am - now).total_seconds()
+            log.info("Daily summary scheduled in %.0f minutes", wait_secs / 60)
+            await asyncio.sleep(wait_secs)
+
+            if not self._notifier:
+                continue
+
+            try:
+                open_pos   = self._registry.open_positions
+                closed_pos = self._registry.closed_positions
+
+                # Positions closed in last 24h
+                cutoff      = __import__("time").time() - 86400
+                closed_today = [
+                    {
+                        "market": p.market_question,
+                        "pnl":    p.realised_pnl,
+                        "reason": p.exit_reason or "?",
+                    }
+                    for p in closed_pos
+                    if p.exit_time and p.exit_time >= cutoff
+                ]
+
+                wins      = [p for p in closed_pos if p.realised_pnl > 0]
+                win_rate  = len(wins) / len(closed_pos) if closed_pos else None
+
+                open_dicts = [
+                    {
+                        "market":         p.market_question,
+                        "unrealised_pnl": 0.0,  # approximation without live price
+                    }
+                    for p in open_pos
+                ]
+
+                total_r = sum(p.realised_pnl for p in closed_pos)
+                deployed = sum(p.size_usdc for p in open_pos)
+
+                await self._notifier.send_daily_summary(
+                    open_positions      = open_dicts,
+                    closed_today        = closed_today,
+                    total_realised_pnl  = total_r,
+                    total_unrealised_pnl= 0.0,
+                    win_rate            = win_rate,
+                    bankroll            = self._cfg.max_position_usdc * 10,
+                    deployed            = deployed,
+                    stats               = self._registry.stats,
+                )
+            except Exception as exc:
+                log.error("Daily summary error: %s", exc)
+
+    async def _on_price_move(self, alert) -> None:
+        """Called by PriceActionMonitor on every significant Binance move."""
+        if alert.is_spike and self._notifier:
+            await self._notifier.send_spike_alert(
+                asset          = alert.asset,
+                move_pct       = alert.move_pct,
+                price_from     = alert.price_then,
+                price_to       = alert.price_now,
+                window_seconds = alert.window_seconds,
+                open_positions = len(self._registry.open_positions),
+            )
+        await self._exit_mgr.evaluate_all(alert.asset)
+
+    async def run(
+        self,
+        *,
+        trading_enabled: bool = False,
+        scan_interval: int = 60,
+    ) -> None:
         """
         Main entry point.
-        Set trading_enabled=True only after validating signals in demo mode.
+        trading_enabled: pass --live from CLI, never edit this default.
+        scan_interval:   seconds between scans, pass --scan-interval from CLI.
         """
         log.info("Starting Polymarket bot (trading=%s)", trading_enabled)
 
         if not trading_enabled:
             await self._read_only_demo()
-            log.info("Trading disabled. Set trading_enabled=True to go live.")
+            log.info("Trading disabled. Run with --live to trade.")
             return
 
         # Start Binance price feed as a persistent background task
@@ -556,8 +738,10 @@ class PolymarketBot:
 
         # Start Telegram notifier if configured
         tasks = [
-            self._trading_loop(scan_interval=60.0),
+            self._trading_loop(scan_interval=float(scan_interval)),
             self._ws_monitor(watch_tokens),
+            self._price_monitor.run(),
+            self._daily_summary_loop(),
             feed_task,
         ]
         if self._notifier:
@@ -575,10 +759,61 @@ class PolymarketBot:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Polymarket trading bot")
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        default=False,
+        help="Enable live trading. Without this flag the bot runs in read-only demo mode.",
+    )
+    parser.add_argument(
+        "--scan-interval",
+        type=int,
+        default=60,
+        help="Seconds between market scans in live mode (default: 60)",
+    )
+    parser.add_argument(
+        "--min-edge",
+        type=float,
+        default=0.05,
+        help="Minimum edge threshold to generate a signal (default: 0.05)",
+    )
+    parser.add_argument(
+        "--max-order",
+        type=float,
+        default=None,
+        help="Override max order size in USDC (default: from Config)",
+    )
+    args = parser.parse_args()
+
     cfg = Config.from_env()
-    bot = PolymarketBot(cfg)
+
+    # Override config with CLI args where provided
+    if args.max_order is not None:
+        import dataclasses
+        cfg = dataclasses.replace(cfg, max_order_usdc=args.max_order)
+
+    bot = PolymarketBot(cfg, min_edge=args.min_edge)
+
+    if args.live:
+        log.warning("=" * 60)
+        log.warning("LIVE TRADING ENABLED — real money will be spent")
+        log.warning("max_order_usdc = $%.2f", cfg.max_order_usdc)
+        log.warning("min_edge       = %.0f%%", args.min_edge * 100)
+        log.warning("scan_interval  = %ds", args.scan_interval)
+        log.warning("=" * 60)
+        # 5-second grace period to Ctrl+C if you launched this by accident
+        import time
+        for i in range(5, 0, -1):
+            log.warning("Starting in %d seconds... (Ctrl+C to abort)", i)
+            time.sleep(1)
 
     try:
-        asyncio.run(bot.run(trading_enabled=False))  # ← flip to True when ready
+        asyncio.run(bot.run(
+            trading_enabled=args.live,
+            scan_interval=args.scan_interval,
+        ))
     except KeyboardInterrupt:
         log.info("Bot stopped.")
