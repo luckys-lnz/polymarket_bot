@@ -3,3 +3,6 @@ venv/
 .env
 .builder-env
 __pycache__/
+.bot_state
+paper_trades.json
+position_registry.json
