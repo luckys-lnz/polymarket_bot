@@ -68,6 +68,7 @@ class RegistryPosition:
     entry_time:          float
     end_date:            str
     asset:               str
+    condition_id:        Optional[str] = None
 
     exit_price:    Optional[float] = None
     exit_time:     Optional[float] = None

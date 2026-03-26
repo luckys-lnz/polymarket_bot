@@ -14,7 +14,7 @@ import aiohttp
 import websockets
 from rich import box
 from rich.columns import Columns
-from rich.console import Console
+from rich.console import Console, Group
 from rich.live import Live
 from rich.layout import Layout
 from rich.panel import Panel
@@ -34,6 +34,13 @@ console     = Console()
 live_prices: dict[str, float] = {}
 live_spots:  dict[str, float] = {"BTC": 0.0, "ETH": 0.0, "SOL": 0.0}
 bot_state:   dict[str, Any]   = {}
+
+
+def _term_width() -> int:
+    try:
+        return console.size.width
+    except Exception:
+        return 120
 
 # ── Theme ─────────────────────────────────────────────────────────────────────
 _GREEN  = "bold #4ade80"
@@ -159,8 +166,9 @@ def _header() -> Panel:
     btc   = f"BTC ${live_spots['BTC']:,.0f}" if live_spots["BTC"] > 1000 else "BTC —"
     eth   = f"ETH ${live_spots['ETH']:,.0f}" if live_spots["ETH"] > 10   else "ETH —"
     mode  = _state("mode", "LIVE")
-    bal   = f"USDC ${_state('bankroll', 0):,.2f}" if _state("bankroll") else ""
-    dot   = Text(f"● {mode}", style=f"bold {_GREEN if mode == 'LIVE' else _YELLOW}")
+    bal   = f"USDC ${_state('bankroll'):,.2f}" if _state("bankroll") else "USDC —"
+    bot_running = STATE_FILE.is_file()
+    dot   = Text(f"● {mode}", style=f"bold {_GREEN if mode == 'LIVE' else _YELLOW}") if bot_running             else Text("● OFFLINE", style=f"bold {_RED}")
 
     # File freshness indicator
     try:
@@ -195,10 +203,15 @@ def _card(label: str, value: str, sub: str = "", val_style: str = _WHITE) -> Pan
         style=f"on {_BG2}", border_style=_BORDER, padding=(0, 1), height=6,
     )
 
-def _metrics(positions: list[dict]) -> Columns:
+def _metrics(positions: list[dict], width: int) -> Group | Columns:
     open_p   = [p for p in positions if not p.get("exit_price")]
     closed_p = [p for p in positions if p.get("exit_price")]
-    bankroll = float(_state("bankroll", 500.0))
+
+    # Bankroll comes exclusively from .bot_state written by main.py
+    # No static fallback — if the bot isn't running we show — not a fake number
+    bankroll_raw = _state("bankroll")
+    bankroll     = float(bankroll_raw) if bankroll_raw is not None else None
+
     deployed = sum(float(p.get("size_usdc", 0)) for p in open_p)
     u_pnl    = sum(_pnl(p) for p in open_p)
     r_pnl    = sum(_pnl(p) for p in closed_p)
@@ -207,11 +220,21 @@ def _metrics(positions: list[dict]) -> Columns:
     avg_edge = (sum(float(p.get("edge_at_entry", 0)) for p in positions)
                 / len(positions) if positions else 0)
 
-    return Columns([
-        _card("BANKROLL",       f"${bankroll:,.2f}",   "USDC"),
-        _card("DEPLOYED",       f"${deployed:,.2f}",   f"{deployed/bankroll*100:.1f}% used", _YELLOW),
+    # Safe percentage helpers — never divide by zero or None
+    def _pct_of(part: float, whole: float | None) -> str:
+        if whole is None or whole == 0:
+            return "—"
+        return f"{part / whole * 100:.1f}%"
+
+    bankroll_str  = f"${bankroll:,.2f}" if bankroll is not None else "—"
+    deployed_sub  = f"{_pct_of(deployed, bankroll)} used"
+    u_pnl_sub     = f"{_pct_of(u_pnl, bankroll)} of bankroll"
+
+    cards = [
+        _card("BANKROLL",       bankroll_str,   "USDC" if bankroll else "bot not running"),
+        _card("DEPLOYED",       f"${deployed:,.2f}",   deployed_sub, _YELLOW),
         _card("UNREALISED P&L", f"{'+'if u_pnl>=0 else''}${u_pnl:.2f}",
-              f"{u_pnl/bankroll*100:+.2f}% of bankroll", _pnl_style(u_pnl)),
+              u_pnl_sub, _pnl_style(u_pnl)),
         _card("REALISED P&L",   f"{'+'if r_pnl>=0 else''}${r_pnl:.2f}",
               f"{len(closed_p)} closed", _pnl_style(r_pnl)),
         _card("WIN RATE",
@@ -220,11 +243,32 @@ def _metrics(positions: list[dict]) -> Columns:
               _GREEN if (win_rate or 0) >= 0.55 else (_YELLOW if (win_rate or 0) >= 0.45 else _RED)),
         _card("AVG EDGE",       f"+{avg_edge*100:.1f}pp",
               f"{len(open_p)} open positions", _edge_style(avg_edge)),
-    ], equal=True, expand=True)
+    ]
+
+    if width < 100:
+        per_row = 2
+    elif width < 150:
+        per_row = 3
+    else:
+        per_row = 6
+
+    rows = [Columns(cards[i:i+per_row], equal=True, expand=True)
+            for i in range(0, len(cards), per_row)]
+    return rows[0] if len(rows) == 1 else Group(*rows)
+
+
+def _metric_rows(width: int) -> int:
+    if width < 100:
+        per_row = 2
+    elif width < 150:
+        per_row = 3
+    else:
+        per_row = 6
+    return (6 + per_row - 1) // per_row
 
 
 # ── UI: P&L bars ─────────────────────────────────────────────────────────────
-def _bars(positions: list[dict]) -> Panel:
+def _bars(positions: list[dict], width: int) -> Panel:
     open_p = [p for p in positions if not p.get("exit_price")]
     if not open_p:
         return Panel(Text("No open positions", style=_DIM, justify="center"),
@@ -234,16 +278,19 @@ def _bars(positions: list[dict]) -> Panel:
     sorted_p = sorted(open_p, key=_pnl, reverse=True)
     now_str  = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
 
+    label_w   = max(12, min(22, width // 6))
+    bar_width = max(12, min(48, width - (label_w + 22)))
+
     t = Table.grid(expand=True, padding=(0, 1))
-    t.add_column(width=20)
+    t.add_column(width=label_w)
     t.add_column(ratio=1)
     t.add_column(width=9, justify="right")
 
     for i, p in enumerate(sorted_p):
         v        = _pnl(p)
         label    = _shorten(p.get("market_question", "?"), 18)
-        fill     = int(abs(v) / max_pnl * 38)
-        bar      = "█" * fill + "░" * (38 - fill)
+        fill     = int(abs(v) / max_pnl * bar_width)
+        bar      = "█" * fill + "░" * (bar_width - fill)
         t.add_row(
             Text(label, style=_DIM),
             Text(bar,   style="#4ade80" if v >= 0 else "#f87171"),
@@ -257,7 +304,7 @@ def _bars(positions: list[dict]) -> Panel:
 
 
 # ── UI: Positions table (open or closed) ──────────────────────────────────────
-def _positions_table(positions: list[dict], closed: bool = False) -> Panel:
+def _positions_table(positions: list[dict], closed: bool = False, width: int = 120) -> Panel:
     items = [p for p in positions if bool(p.get("exit_price")) == closed]
     title = "CLOSED POSITIONS" if closed else f"OPEN POSITIONS  ({len(items)})"
 
@@ -274,24 +321,36 @@ def _positions_table(positions: list[dict], closed: bool = False) -> Panel:
               header_style=f"bold {_DIM}", style=f"on {_BG2}",
               row_styles=[f"on {_BG2}", f"on {_BG}"])
 
+    mode = "full"
+    if width < 90:
+        mode = "micro"
+    elif width < 120:
+        mode = "compact"
+
     t.add_column("Market",  ratio=3, no_wrap=True)
     t.add_column("Token",   width=6,  justify="center")
-    t.add_column("Entry",   width=7,  justify="right")
 
-    if closed:
-        t.add_column("Exit",    width=7,  justify="right")
-        t.add_column("Edge in", width=8,  justify="right")
-        t.add_column("Size",    width=7,  justify="right")
-        t.add_column("P&L",     width=9,  justify="right")
-        t.add_column("Reason",  width=8,  justify="center")
-        t.add_column("When",    width=12, justify="right")
+    if mode == "micro":
+        t.add_column("P&L", width=9, justify="right")
     else:
-        t.add_column("Mark",    width=7,  justify="right")
-        t.add_column("Fair",    width=7,  justify="right")
-        t.add_column("Edge",    width=8,  justify="right")
-        t.add_column("Size",    width=7,  justify="right")
-        t.add_column("P&L",     width=9,  justify="right")
-        t.add_column("When",    width=12, justify="right")
+        t.add_column("Entry",   width=7,  justify="right")
+        if closed:
+            t.add_column("Exit", width=7, justify="right")
+        else:
+            t.add_column("Mark", width=7, justify="right")
+
+        if mode == "full":
+            if closed:
+                t.add_column("Edge in", width=8, justify="right")
+            else:
+                t.add_column("Fair", width=7, justify="right")
+                t.add_column("Edge", width=8, justify="right")
+
+        t.add_column("Size", width=7, justify="right")
+        t.add_column("P&L",  width=9, justify="right")
+        if mode == "full" and closed:
+            t.add_column("Reason",  width=8,  justify="center")
+        t.add_column("When", width=12, justify="right")
 
     for p in items:
         entry  = float(p.get("entry_price", 0))
@@ -304,32 +363,49 @@ def _positions_table(positions: list[dict], closed: bool = False) -> Panel:
                   if ts else "—")
         reason = p.get("exit_reason", "")
 
+        if mode == "micro":
+            t.add_row(
+                Text(_shorten(p.get("market_question", "?"), 28), style=_WHITE),
+                _outcome_badge(p.get("held_outcome", "?")),
+                _fmt_pnl(v),
+            )
+            continue
+
         if closed:
             r_style = _GREEN if reason == "take_profit" else (_RED if reason == "stop_loss" else _MUTED)
-            t.add_row(
+            row = [
                 Text(_shorten(p.get("market_question", "?"), 34), style=_WHITE),
                 _outcome_badge(p.get("held_outcome", "?")),
                 Text(f"{entry:.3f}", style=_DIM),
                 Text(f"{mark:.3f}",  style=_GREEN if mark > entry else _RED),
-                Text(f"+{edge*100:.1f}pp", style=_DIM),
+            ]
+            if mode == "full":
+                row.append(Text(f"+{edge*100:.1f}pp", style=_DIM))
+            row += [
                 Text(f"${float(p.get('size_usdc',0)):.2f}", style=_WHITE),
                 _fmt_pnl(v),
-                Text(reason[:4].upper() if reason else "—", style=r_style),
-                Text(when, style=_DIM),
-            )
+            ]
+            if mode == "full":
+                row.append(Text(reason[:4].upper() if reason else "—", style=r_style))
+            row.append(Text(when, style=_DIM))
+            t.add_row(*row)
         else:
             exp    = float(p.get("days_to_expiry", 0))
-            t.add_row(
+            row = [
                 Text(_shorten(p.get("market_question", "?"), 34), style=_WHITE),
                 _outcome_badge(p.get("held_outcome", "?")),
                 Text(f"{entry:.3f}", style=_DIM),
                 Text(f"{mark:.3f}",  style=_GREEN if mark < entry else (_RED if mark > entry else _WHITE)),
-                Text(f"{fair:.3f}",  style=_DIM),
-                Text(f"+{edge*100:.1f}pp", style=_edge_style(edge)),
+            ]
+            if mode == "full":
+                row.append(Text(f"{fair:.3f}",  style=_DIM))
+                row.append(Text(f"+{edge*100:.1f}pp", style=_edge_style(edge)))
+            row += [
                 Text(f"${float(p.get('size_usdc',0)):.2f}", style=_WHITE),
                 _fmt_pnl(v),
                 Text(when, style=_RED if exp < 3 else (_YELLOW if exp < 7 else _DIM)),
-            )
+            ]
+            t.add_row(*row)
 
     return Panel(t, title=Text(title, style=f"bold {_DIM}"), title_align="left",
                  style=f"on {_BG}", border_style=_BORDER, padding=(0, 0))
@@ -368,12 +444,40 @@ def _scorecard(positions: list[dict]) -> Panel:
 
 
 # ── Full layout ───────────────────────────────────────────────────────────────
-def _build(positions: list[dict]) -> Layout:
+def _build(positions: list[dict], width: int, height: int) -> Layout:
+    # Warn when .bot_state missing so user knows dashboard isn't synced
+    if not STATE_FILE.is_file():
+        import sys
+        # Don't crash — just note it in the header area
+        pass
     layout = Layout()
+
+    metrics_rows = _metric_rows(width)
+    metrics_h    = max(6, metrics_rows * 6 + (metrics_rows - 1))
+    bars_h       = max(4, len([p for p in positions if not p.get("exit_price")]) * 2 + 4)
+    bars_h       = min(bars_h, max(4, height // 3))
+
+    if width < 110:
+        layout.split(
+            Layout(name="header",    size=3),
+            Layout(name="metrics",   size=metrics_h),
+            Layout(name="bars",      size=bars_h),
+            Layout(name="open",      ratio=1),
+            Layout(name="closed",    ratio=1),
+            Layout(name="scorecard", size=7),
+        )
+        layout["header"].update(_header())
+        layout["metrics"].update(_metrics(positions, width))
+        layout["bars"].update(_bars(positions, width))
+        layout["open"].update(_positions_table(positions, closed=False, width=width))
+        layout["closed"].update(_positions_table(positions, closed=True,  width=width))
+        layout["scorecard"].update(_scorecard(positions))
+        return layout
+
     layout.split(
         Layout(name="header",    size=3),
-        Layout(name="metrics",   size=8),
-        Layout(name="bars",      size=len([p for p in positions if not p.get("exit_price")]) * 2 + 4),
+        Layout(name="metrics",   size=metrics_h),
+        Layout(name="bars",      size=bars_h),
         Layout(name="tables",    ratio=1),
         Layout(name="scorecard", size=7),
     )
@@ -382,10 +486,10 @@ def _build(positions: list[dict]) -> Layout:
         Layout(name="closed", ratio=2),
     )
     layout["header"].update(_header())
-    layout["metrics"].update(_metrics(positions))
-    layout["bars"].update(_bars(positions))
-    layout["open"].update(_positions_table(positions, closed=False))
-    layout["closed"].update(_positions_table(positions, closed=True))
+    layout["metrics"].update(_metrics(positions, width))
+    layout["bars"].update(_bars(positions, width))
+    layout["open"].update(_positions_table(positions, closed=False, width=width))
+    layout["closed"].update(_positions_table(positions, closed=True,  width=width))
     layout["scorecard"].update(_scorecard(positions))
     return layout
 
@@ -410,7 +514,9 @@ async def _run(live_mode: bool) -> None:
                         live_spots[sym] = float(prc)
         except Exception:
             pass
-        console.print(_build(positions))
+        w = _term_width()
+        h = console.size.height if hasattr(console, "size") else 40
+        console.print(_build(positions, w, h))
         return
 
     # Launch feeds as isolated background tasks — if one fails it won't block the UI
@@ -424,7 +530,9 @@ async def _run(live_mode: bool) -> None:
 
     current = [positions]  # mutable container to avoid scoping issues
 
-    with Live(_build(current[0]), refresh_per_second=max(1, round(1/UI_REFRESH_SECS)),
+    w = _term_width()
+    h = console.size.height if hasattr(console, "size") else 40
+    with Live(_build(current[0], w, h), refresh_per_second=max(1, round(1/UI_REFRESH_SECS)),
               console=console, screen=True) as live:
         while True:
             await asyncio.sleep(UI_REFRESH_SECS)
@@ -433,12 +541,15 @@ async def _run(live_mode: bool) -> None:
             # Smart redraw: only update positions if registry actually changed
             if new_pos != current[0]:
                 current[0] = new_pos
-            live.update(_build(current[0]))
+            w = _term_width()
+            h = console.size.height if hasattr(console, "size") else 40
+            live.update(_build(current[0], w, h))
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Polymarket bot dashboard")
     parser.add_argument("--live", action="store_true", help="Auto-refresh (1.2s UI, 4.8s prices)")
+    parser.add_argument("--snapshot", action="store_true", help="Render once and exit")
     parser.add_argument("--dir",  type=str, default=None,
                         help="Bot working directory — use if dashboard is in a different folder")
     args = parser.parse_args()
@@ -453,7 +564,8 @@ def main() -> None:
           f"({'found' if STATE_FILE.is_file() else 'NOT FOUND — is main.py running?'})")
     print()
 
-    asyncio.run(_run(args.live))
+    live_mode = args.live or not args.snapshot
+    asyncio.run(_run(live_mode))
 
 
 if __name__ == "__main__":

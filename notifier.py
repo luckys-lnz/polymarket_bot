@@ -50,6 +50,8 @@ class TelegramNotifier:
         self._bot       = Bot(token=token)
         self._pending:  dict[str, asyncio.Future[bool]] = {}
         self._app:      Optional[Application] = None
+        self._bot_ready = False
+        self._bot_lock  = asyncio.Lock()
         self.paper_mode = False
 
     @classmethod
@@ -63,7 +65,17 @@ class TelegramNotifier:
     def _tag(self) -> str:
         return "📄 *[PAPER]* " if self.paper_mode else ""
 
+    async def _ensure_bot(self) -> None:
+        if self._bot_ready:
+            return
+        async with self._bot_lock:
+            if self._bot_ready:
+                return
+            await self._bot.initialize()
+            self._bot_ready = True
+
     async def start(self) -> None:
+        await self._ensure_bot()
         self._app = Application.builder().token(self._token).build()
         self._app.add_handler(CallbackQueryHandler(self._handle_callback))
         await self._app.initialize()
@@ -76,14 +88,26 @@ class TelegramNotifier:
             await self._app.updater.stop()
             await self._app.stop()
             await self._app.shutdown()
+        if self._bot_ready:
+            await self._bot.shutdown()
+            self._bot_ready = False
 
     async def send(self, message: str) -> None:
         try:
+            await self._ensure_bot()
             await self._bot.send_message(
                 chat_id=self._chat_id, text=message, parse_mode="Markdown"
             )
         except Exception as exc:
             log.warning("Telegram send failed: %s", exc)
+            # Fallback to plain text (no Markdown) so notifications still arrive.
+            try:
+                await self._ensure_bot()
+                await self._bot.send_message(
+                    chat_id=self._chat_id, text=message
+                )
+            except Exception as exc2:
+                log.warning("Telegram plain send failed: %s", exc2)
 
     async def send_entry_notification(
         self, *, market: str, held_outcome: str, entry_price: float,
@@ -204,14 +228,23 @@ class TelegramNotifier:
             InlineKeyboardButton("❌ NO",  callback_data=f"no:{signal_id}"),
         ]])
         try:
+            await self._ensure_bot()
             await self._bot.send_message(
                 chat_id=self._chat_id, text=message,
                 parse_mode="Markdown", reply_markup=keyboard,
             )
         except Exception as exc:
-            log.warning("Approval send failed: %s — auto-trading", exc)
-            self._pending.pop(signal_id, None)
-            return True
+            log.warning("Approval send failed: %s — retrying without Markdown", exc)
+            try:
+                await self._ensure_bot()
+                await self._bot.send_message(
+                    chat_id=self._chat_id, text=message,
+                    reply_markup=keyboard,
+                )
+            except Exception as exc2:
+                log.warning("Approval send failed: %s — auto-trading", exc2)
+                self._pending.pop(signal_id, None)
+                return True
         try:
             return await asyncio.wait_for(future, timeout=_APPROVAL_TIMEOUT)
         except asyncio.TimeoutError:

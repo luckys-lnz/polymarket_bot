@@ -88,5 +88,11 @@ class OrderManager:
     def get_open_orders(self) -> list[dict]:
         return self._client.get_orders()
 
+    def get_order(self, order_id: str) -> dict:
+        return self._client.get_order(order_id)
+
+    def get_trades(self, params=None) -> list[dict]:
+        return self._client.get_trades(params)
+
     def get_api_keys(self) -> ApiCreds:
         return self._client.create_or_derive_api_creds()

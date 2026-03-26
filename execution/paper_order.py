@@ -63,3 +63,6 @@ class PaperOrderManager:
 
     def get_api_keys(self):
         return None
+
+    def get_order(self, order_id: str) -> dict:
+        return {"orderID": order_id, "status": "paper"}

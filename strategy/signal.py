@@ -60,8 +60,21 @@ class CryptoStrategy:
         self._min_vol   = min_volume
         self._max_kelly = max_kelly_fraction
 
+    @property
+    def min_edge(self) -> float:
+        return self._min_edge
+
     async def evaluate(self, market: Market) -> Optional[TradeSignal]:
         if market.volume_24h < self._min_vol:
+            return None
+
+        # Reject already-settled markets — YES=1.000 or NO=1.000 means resolved
+        # Entering these creates an immediate guaranteed loss
+        if market.yes_price >= 0.995 or market.no_price >= 0.995:
+            log.debug("Market already settled — skipping: %s", market.question[:60])
+            return None
+        if market.yes_price <= 0.005 or market.no_price <= 0.005:
+            log.debug("Market token at zero — likely settled: %s", market.question[:60])
             return None
 
         parsed = parse_market_question(market.question, market.end_date)

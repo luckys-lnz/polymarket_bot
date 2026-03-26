@@ -2,28 +2,28 @@
 from __future__ import annotations
 
 import asyncio
-import datetime as dt
+import aiohttp
 import json
+import datetime as dt
 import logging
 import os
 import time
 from typing import Optional
 
-import aiohttp
-
 from config import Config
-from execution.base import OrderManagerBase
-from execution.data_client import DataClient
-from execution.order_manager import OrderManager
-from execution.paper_order import PaperOrderManager
 from feeds.binance import BinanceFeed
 from feeds.gamma import GammaClient
 from feeds.volatility import VolatilityFeed
+from execution.data_client import DataClient
+from execution.base import OrderManagerBase
+from execution.order_manager import OrderManager
+from execution.paper_order import PaperOrderManager
 from models import RegistryPosition
 from monitoring.exit_manager import AutoExitManager
 from monitoring.price_monitor import PriceActionMonitor
 from notifier import TelegramNotifier
 from registry import PositionRegistry
+from order_registry import OrderRegistry, OrderRecord
 from strategy.signal import CryptoStrategy
 
 log = logging.getLogger(__name__)
@@ -35,6 +35,8 @@ _ASSET_KEYWORDS = {
     "XRP": ["xrp", "ripple"],
     "BNB": ["bnb", "binance"],
 }
+_REPRICE_EPS_ABS = 0.001
+_REPRICE_EPS_REL = 0.02
 
 
 def _extract_asset(question: str) -> str:
@@ -64,6 +66,8 @@ class PolymarketBot:
                                         min_edge=min_edge, min_volume=config.min_liquidity)
         self._registry = PositionRegistry()
         self._registry.load()
+        self._order_registry = OrderRegistry()
+        self._order_registry.load()
 
         self._notifier: Optional[TelegramNotifier] = None
         if os.environ.get("TELEGRAM_TOKEN"):
@@ -82,7 +86,7 @@ class PolymarketBot:
         feed = asyncio.create_task(self._spot.start())
         log.info("Waiting 3s for Binance prices...")
         await asyncio.sleep(3)
-        markets = await self._gamma.get_active_markets(limit=200, min_volume=self._cfg.min_liquidity)
+        markets = await self._gamma.get_active_markets(limit=500, min_volume=self._cfg.min_liquidity)
         log.info("Scanning %d markets...", len(markets))
         found = 0
         for market in markets:
@@ -95,28 +99,511 @@ class PolymarketBot:
             log.info("No signals found.")
         feed.cancel()
 
+    @staticmethod
+    def _extract_order_id(payload) -> Optional[str]:
+        """Best-effort extraction of order id from CLOB responses."""
+        if not isinstance(payload, dict):
+            return None
+        for key in ("orderID", "orderId", "order_id", "id"):
+            if key in payload and payload[key]:
+                return str(payload[key])
+        order = payload.get("order")
+        if isinstance(order, dict):
+            for key in ("id", "orderID", "orderId", "order_id"):
+                if key in order and order[key]:
+                    return str(order[key])
+        return None
+
+    @staticmethod
+    def _local_order_id(token_id: str) -> str:
+        return f"local_{token_id[:6]}_{int(time.time() * 1000)}"
+
+    @staticmethod
+    def _is_local_order_id(order_id: str) -> bool:
+        return order_id.startswith("local_")
+
+    @staticmethod
+    def _parse_order_detail(payload: dict) -> tuple[Optional[str], Optional[float], Optional[float]]:
+        """
+        Best-effort parse of order detail response.
+        Returns (status, filled_tokens, total_tokens).
+        """
+        if not isinstance(payload, dict):
+            return None, None, None
+
+        status = payload.get("status") or payload.get("state")
+
+        def _num(*keys):
+            for k in keys:
+                v = payload.get(k)
+                if v is None:
+                    continue
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    continue
+            return None
+
+        total = _num("size", "originalSize", "original_size", "qty", "quantity")
+        filled = _num("filledSize", "filled_size", "filled", "filledQty", "filled_quantity")
+        remaining = _num("remainingSize", "remaining_size", "remaining", "remainingQty", "remaining_quantity")
+
+        if filled is None and total is not None and remaining is not None:
+            filled = max(total - remaining, 0.0)
+
+        return status, filled, total
+
+    @staticmethod
+    def _parse_book_levels(levels) -> list[tuple[float, float]]:
+        parsed: list[tuple[float, float]] = []
+        if not levels:
+            return parsed
+        for lvl in levels:
+            price = size = None
+            if isinstance(lvl, dict):
+                price = lvl.get("price") or lvl.get("p")
+                size  = lvl.get("size") or lvl.get("s")
+            elif isinstance(lvl, (list, tuple)) and len(lvl) >= 2:
+                price, size = lvl[0], lvl[1]
+            try:
+                if price is not None and size is not None:
+                    parsed.append((float(price), float(size)))
+            except (ValueError, TypeError):
+                continue
+        return parsed
+
+    @staticmethod
+    def _price_changed_enough(old_price: float, new_price: float) -> bool:
+        if old_price <= 0:
+            return True
+        delta = abs(new_price - old_price)
+        return delta >= max(_REPRICE_EPS_ABS, old_price * _REPRICE_EPS_REL)
+
+    def _min_edge_for_order(self, order: OrderRecord) -> float:
+        return order.min_edge if order.min_edge > 0 else self._strategy.min_edge
+
+    async def _maybe_reprice_order(
+        self,
+        order: OrderRecord,
+        *,
+        now: float,
+        book: dict,
+        allow_replace: bool,
+    ) -> bool:
+        """
+        Reprice or cancel stale orders based on current orderbook and min edge.
+        Returns True if the order was canceled/replaced and caller should skip.
+        """
+        if self._cfg.order_reprice_secs <= 0:
+            return False
+        last_ts = order.updated_ts or order.created_ts or now
+        if now - last_ts < self._cfg.order_reprice_secs:
+            return False
+
+        asks = self._parse_book_levels(book.get("asks") if isinstance(book, dict) else None)
+        bids = self._parse_book_levels(book.get("bids") if isinstance(book, dict) else None)
+        best_ask = min((p for p, _ in asks), default=None)
+        best_bid = max((p for p, _ in bids), default=None)
+        if best_ask is None and best_bid is None:
+            return False
+
+        # Cancel if the book looks resolved or non-tradable.
+        hi = max(p for p in (best_ask, best_bid) if p is not None)
+        lo = min(p for p in (best_ask, best_bid) if p is not None)
+        if hi >= 0.995 or lo <= 0.005:
+            if allow_replace and (self._paper_mode or not self._is_local_order_id(order.order_id)):
+                if not self._paper_mode:
+                    try:
+                        self._orders.cancel_order(order.order_id)
+                    except Exception as exc:
+                        log.warning("Cancel failed for %s: %s", order.order_id, exc)
+                        return False
+            self._order_registry.update(order.order_id, status="canceled")
+            return True
+
+        fair = order.fair_value
+        if fair <= 0:
+            return False
+        min_edge = self._min_edge_for_order(order)
+        remaining_tokens = max(order.size_tokens - order.filled_tokens, 0.0)
+        if remaining_tokens <= 0:
+            self._order_registry.update(order.order_id, status="filled")
+            return True
+
+        if order.side == "BUY":
+            max_price = fair - min_edge
+            if max_price <= 0:
+                self._order_registry.update(order.order_id, status="canceled")
+                return True
+            if best_ask is None:
+                return False
+            if best_ask > max_price:
+                if allow_replace and (self._paper_mode or not self._is_local_order_id(order.order_id)):
+                    if not self._paper_mode:
+                        try:
+                            self._orders.cancel_order(order.order_id)
+                        except Exception as exc:
+                            log.warning("Cancel failed for %s: %s", order.order_id, exc)
+                            return False
+                    self._order_registry.update(order.order_id, status="canceled")
+                    return True
+                return False
+            new_price = min(best_ask, max_price)
+            new_edge  = fair - new_price
+        else:
+            min_price = fair + min_edge
+            if min_price >= 1.0:
+                self._order_registry.update(order.order_id, status="canceled")
+                return True
+            if best_bid is None:
+                return False
+            if best_bid < min_price:
+                if allow_replace and (self._paper_mode or not self._is_local_order_id(order.order_id)):
+                    if not self._paper_mode:
+                        try:
+                            self._orders.cancel_order(order.order_id)
+                        except Exception as exc:
+                            log.warning("Cancel failed for %s: %s", order.order_id, exc)
+                            return False
+                    self._order_registry.update(order.order_id, status="canceled")
+                    return True
+                return False
+            new_price = max(best_bid, min_price)
+            new_edge  = new_price - fair
+
+        if not self._price_changed_enough(order.limit_price, new_price):
+            return False
+        if not allow_replace:
+            return False
+
+        budget_usdc = order.size_usdc
+        if budget_usdc <= 0:
+            budget_usdc = order.size_tokens * order.limit_price
+        spent_usdc = order.filled_tokens * order.limit_price
+        remaining_usdc = max(budget_usdc - spent_usdc, 0.0)
+        if remaining_usdc < 1.0:
+            self._order_registry.update(order.order_id, status="canceled")
+            return True
+
+        max_tokens = remaining_usdc / new_price if new_price > 0 else 0.0
+        new_size_tokens = min(remaining_tokens, round(max_tokens, 4))
+        if new_size_tokens <= 0:
+            self._order_registry.update(order.order_id, status="canceled")
+            return True
+
+        if not self._paper_mode and not self._is_local_order_id(order.order_id):
+            try:
+                self._orders.cancel_order(order.order_id)
+            except Exception as exc:
+                log.warning("Reprice cancel failed for %s: %s", order.order_id, exc)
+                return False
+
+        try:
+            result = self._orders.place_limit_order_tokens(
+                token_id=order.token_id, side=order.side,
+                price=new_price, size_tokens=new_size_tokens, neg_risk=order.neg_risk,
+            )
+        except Exception as exc:
+            log.warning("Reprice order failed for %s: %s", order.order_id, exc)
+            return False
+
+        new_order_id = self._extract_order_id(result) or self._local_order_id(order.token_id)
+        self._order_registry.update(order.order_id, status="canceled")
+        self._order_registry.add(OrderRecord(
+            order_id        = new_order_id,
+            market_question = order.market_question,
+            token_id        = order.token_id,
+            held_outcome    = order.held_outcome,
+            side            = order.side,
+            limit_price     = new_price,
+            size_tokens     = new_size_tokens,
+            size_usdc       = round(new_size_tokens * new_price, 4),
+            filled_tokens   = 0.0,
+            status          = "pending",
+            created_ts      = now,
+            condition_id    = order.condition_id,
+            asset           = order.asset,
+            end_date        = order.end_date,
+            fair_value      = order.fair_value,
+            edge            = new_edge,
+            size_fraction   = order.size_fraction,
+            days_to_expiry  = order.days_to_expiry,
+            spot_price      = order.spot_price,
+            neg_risk        = order.neg_risk,
+            min_edge        = min_edge,
+        ))
+        log.info("Repriced order %s → %s at %.4f", order.order_id, new_order_id, new_price)
+        return True
+
+    async def _reconcile_orders(self, existing_positions, open_orders) -> None:
+        """
+        Reconcile live and paper orders into positions. Both modes follow
+        the same order lifecycle: pending/open → partial → filled.
+        """
+        active_orders = self._order_registry.active_orders
+        if not active_orders:
+            return
+
+        if self._paper_mode:
+            now = time.time()
+            for order in active_orders:
+                age = now - (order.created_ts or now)
+                if age > self._cfg.order_ttl_secs and order.filled_tokens < order.size_tokens:
+                    self._order_registry.update(order.order_id, status="expired")
+                    continue
+                try:
+                    book = await self._gamma.get_orderbook(order.token_id)
+                except Exception as exc:
+                    log.debug("Orderbook fetch failed for %s: %s",
+                              order.market_question[:60], exc)
+                    continue
+
+                if await self._maybe_reprice_order(
+                    order, now=now, book=book, allow_replace=True
+                ):
+                    continue
+
+                asks = self._parse_book_levels(book.get("asks") if isinstance(book, dict) else None)
+                bids = self._parse_book_levels(book.get("bids") if isinstance(book, dict) else None)
+
+                remaining = max(order.size_tokens - order.filled_tokens, 0.0)
+                if remaining <= 0:
+                    self._order_registry.update(order.order_id, status="filled")
+                    continue
+
+                filled = 0.0
+                cost   = 0.0
+                if order.side == "BUY":
+                    for price, size in sorted(asks, key=lambda x: x[0]):
+                        if price > order.limit_price:
+                            break
+                        take = min(size, remaining - filled)
+                        if take <= 0:
+                            break
+                        filled += take
+                        cost   += take * price
+                        if filled >= remaining:
+                            break
+                else:
+                    for price, size in sorted(bids, key=lambda x: x[0], reverse=True):
+                        if price < order.limit_price:
+                            break
+                        take = min(size, remaining - filled)
+                        if take <= 0:
+                            break
+                        filled += take
+                        cost   += take * price
+                        if filled >= remaining:
+                            break
+
+                if filled > 0:
+                    fill_price = cost / filled
+                    self._registry.add_fill(
+                        market_question     = order.market_question,
+                        token_id            = order.token_id,
+                        held_outcome        = order.held_outcome,
+                        side                = order.side,
+                        fill_price          = fill_price,
+                        fill_tokens         = filled,
+                        fair_value_at_entry = order.fair_value,
+                        edge_at_entry       = order.edge,
+                        neg_risk            = order.neg_risk,
+                        end_date            = order.end_date,
+                        asset               = order.asset,
+                        entry_time          = order.created_ts or time.time(),
+                        condition_id        = order.condition_id,
+                    )
+                    if self._notifier:
+                        await self._notifier.send_entry_notification(
+                            market=order.market_question, held_outcome=order.held_outcome,
+                            entry_price=fill_price, fair_value=order.fair_value,
+                            edge=order.edge, size_usdc=filled * fill_price, size_tokens=filled,
+                            kelly_pct=order.size_fraction * 100,
+                            days_to_expiry=order.days_to_expiry,
+                            spot_price=order.spot_price, asset=order.asset,
+                            stats=self._registry.stats,
+                        )
+                    new_filled = min(order.filled_tokens + filled, order.size_tokens)
+                    status = "filled" if new_filled >= order.size_tokens else "partial"
+                    self._order_registry.update(
+                        order.order_id,
+                        filled_tokens=new_filled,
+                        status=status,
+                    )
+                    self._write_state()
+                else:
+                    if order.status == "pending":
+                        self._order_registry.update(order.order_id, status="open")
+            return
+
+        now = time.time()
+        open_ids: set[str] = set()
+        for o in (open_orders or []):
+            oid = self._extract_order_id(o)
+            if oid:
+                open_ids.add(oid)
+
+        pos_map = {(p.market_title, p.outcome): p for p in (existing_positions or [])}
+        drop_after = 120.0
+
+        for order in active_orders:
+            pos = pos_map.get((order.market_question, order.held_outcome))
+            if pos and pos.size > 0:
+                current = pos.size
+                delta = max(current - order.filled_tokens, 0.0)
+                if delta > 0:
+                    fill_price = pos.avg_price if pos.avg_price > 0 else order.limit_price
+                    self._registry.add_fill(
+                        market_question     = order.market_question,
+                        token_id            = order.token_id,
+                        held_outcome        = order.held_outcome,
+                        side                = order.side,
+                        fill_price          = fill_price,
+                        fill_tokens         = delta,
+                        fair_value_at_entry = order.fair_value,
+                        edge_at_entry       = order.edge,
+                        neg_risk            = order.neg_risk,
+                        end_date            = order.end_date,
+                        asset               = order.asset,
+                        entry_time          = order.created_ts or time.time(),
+                        condition_id        = order.condition_id,
+                    )
+                    if self._notifier:
+                        await self._notifier.send_entry_notification(
+                            market=order.market_question, held_outcome=order.held_outcome,
+                            entry_price=fill_price, fair_value=order.fair_value,
+                            edge=order.edge, size_usdc=delta * fill_price, size_tokens=delta,
+                            kelly_pct=order.size_fraction * 100,
+                            days_to_expiry=order.days_to_expiry,
+                            spot_price=order.spot_price, asset=order.asset,
+                            stats=self._registry.stats,
+                        )
+                    self._write_state()
+                status = "filled" if current >= order.size_tokens else "partial"
+                self._order_registry.update(order.order_id, filled_tokens=current, status=status)
+                continue
+
+            age = now - (order.created_ts or now)
+            expired = age > self._cfg.order_ttl_secs and order.filled_tokens < order.size_tokens
+
+            if order.order_id and order.order_id in open_ids:
+                if order.status == "pending":
+                    self._order_registry.update(order.order_id, status="open")
+                if expired and not self._is_local_order_id(order.order_id):
+                    try:
+                        self._orders.cancel_order(order.order_id)
+                        self._order_registry.update(order.order_id, status="canceled")
+                    except Exception as exc:
+                        log.warning("Cancel failed for %s: %s", order.order_id, exc)
+                    continue
+
+                allow_replace = not self._is_local_order_id(order.order_id)
+                if allow_replace:
+                    try:
+                        book = await self._gamma.get_orderbook(order.token_id)
+                        if await self._maybe_reprice_order(
+                            order, now=now, book=book, allow_replace=True
+                        ):
+                            continue
+                    except Exception as exc:
+                        log.debug("Orderbook fetch failed for %s: %s",
+                                  order.market_question[:60], exc)
+                continue
+
+            # If not open, try to fetch order detail for status/fills.
+            if order.order_id and not self._is_local_order_id(order.order_id):
+                try:
+                    detail = self._orders.get_order(order.order_id)
+                    status, filled, total = self._parse_order_detail(detail)
+                    if filled is not None and filled > order.filled_tokens:
+                        delta = max(filled - order.filled_tokens, 0.0)
+                        if delta > 0:
+                            fill_price = order.limit_price
+                            self._registry.add_fill(
+                                market_question     = order.market_question,
+                                token_id            = order.token_id,
+                                held_outcome        = order.held_outcome,
+                                side                = order.side,
+                                fill_price          = fill_price,
+                                fill_tokens         = delta,
+                                fair_value_at_entry = order.fair_value,
+                                edge_at_entry       = order.edge,
+                                neg_risk            = order.neg_risk,
+                                end_date            = order.end_date,
+                                asset               = order.asset,
+                                entry_time          = order.created_ts or time.time(),
+                                condition_id        = order.condition_id,
+                            )
+                            if self._notifier:
+                                await self._notifier.send_entry_notification(
+                                    market=order.market_question, held_outcome=order.held_outcome,
+                                    entry_price=fill_price, fair_value=order.fair_value,
+                                    edge=order.edge, size_usdc=delta * fill_price, size_tokens=delta,
+                                    kelly_pct=order.size_fraction * 100,
+                                    days_to_expiry=order.days_to_expiry,
+                                    spot_price=order.spot_price, asset=order.asset,
+                                    stats=self._registry.stats,
+                                )
+                            self._write_state()
+                    if status:
+                        norm = str(status).lower()
+                        if norm in ("filled", "complete", "completed"):
+                            self._order_registry.update(order.order_id, status="filled",
+                                                        filled_tokens=filled or order.filled_tokens)
+                            continue
+                        if norm in ("canceled", "cancelled", "expired", "rejected"):
+                            self._order_registry.update(order.order_id, status="canceled")
+                            continue
+                except Exception:
+                    pass
+
+            if expired:
+                self._order_registry.update(order.order_id, status="expired")
+            elif now - (order.created_ts or now) > drop_after:
+                self._order_registry.update(order.order_id, status="canceled")
+
     # ── Trading loop ──────────────────────────────────────────────────────────
     async def _trading_loop(self, scan_interval: float) -> None:
         await self._reconcile_positions()   # sync registry with on-chain state
 
         while True:
             try:
-                markets  = await self._gamma.get_active_markets(limit=200, min_volume=self._cfg.min_liquidity)
+                markets  = await self._gamma.get_active_markets(limit=500, min_volume=self._cfg.min_liquidity)
                 existing = await self._data.get_positions(self._orders.wallet)
+                open_orders = []
+                if not self._paper_mode:
+                    try:
+                        open_orders = self._orders.get_open_orders()
+                    except Exception as exc:
+                        log.warning("Could not fetch open orders: %s", exc)
+                await self._reconcile_orders(existing, open_orders)
+
                 active   = {p.market_title for p in existing}
                 active  |= {p.market_question for p in self._registry.open_positions}
+                # Include closed positions — prevents re-entering a market
+                # that just resolved (closed positions drop out of open_positions
+                # so without this the bot re-enters every scan until it stops)
+                active  |= {p.market_question for p in self._registry.closed_positions}
+                active_orders = self._order_registry.active_orders
+                pending_count = len(active_orders)
+                active  |= {o.market_question for o in active_orders}
 
                 # Cap concurrent positions — never deploy more than max_positions
                 max_positions = int(self._cfg.starting_bankroll / self._cfg.max_order_usdc)
                 max_positions = max(5, min(max_positions, 15))  # floor 5, cap 15
-                if len(self._registry.open_positions) >= max_positions:
+                if (len(self._registry.open_positions) + pending_count) >= max_positions:
                     log.info("Max positions (%d) reached — skipping scan", max_positions)
                     break
 
                 for market in markets:
                     if market.question in active:
                         continue
-                    if len(self._registry.open_positions) >= max_positions:
+                    # Skip markets that appear resolved or effectively settled.
+                    # If either token is near 0 or 1, the market is not tradable.
+                    if max(market.yes_price, market.no_price) >= 0.995 or \
+                       min(market.yes_price, market.no_price) <= 0.005:
+                        continue
+                    if (len(self._registry.open_positions) + pending_count) >= max_positions:
                         break
                     signal = await self._strategy.evaluate(market)
                     if signal is None:
@@ -132,7 +619,7 @@ class PolymarketBot:
                     spot        = self._spot.price(asset) or 0.0
 
                     try:
-                        self._orders.place_limit_order(
+                        result = self._orders.place_limit_order(
                             token_id=signal.token_id, side=signal.side,
                             price=signal.market_price, size_usdc=size_usdc,
                             neg_risk=signal.neg_risk,
@@ -141,33 +628,37 @@ class PolymarketBot:
                         log.error("Order failed: %s", exc)
                         continue
 
-                    self._registry.open(RegistryPosition(
-                        market_question     = signal.market_question,
-                        token_id            = signal.token_id,
-                        held_outcome        = signal.held_outcome,
-                        side                = signal.side,
-                        entry_price         = signal.market_price,
-                        size_tokens         = size_tokens,
-                        size_usdc           = size_usdc,
-                        fair_value_at_entry = signal.fair_value,
-                        edge_at_entry       = signal.edge,
-                        neg_risk            = signal.neg_risk,
-                        entry_time          = time.time(),
-                        end_date            = market.end_date,
-                        asset               = asset,
+                    order_id = self._extract_order_id(result)
+                    if not order_id:
+                        order_id = self._local_order_id(signal.token_id)
+                    self._order_registry.add(OrderRecord(
+                        order_id        = order_id,
+                        market_question = signal.market_question,
+                        token_id        = signal.token_id,
+                        held_outcome    = signal.held_outcome,
+                        side            = signal.side,
+                        limit_price     = signal.market_price,
+                        size_tokens     = size_tokens,
+                        size_usdc       = size_usdc,
+                        filled_tokens   = 0.0,
+                        status          = "pending",
+                        created_ts      = time.time(),
+                        condition_id    = market.condition_id,
+                        asset           = asset,
+                        end_date        = market.end_date,
+                        fair_value      = signal.fair_value,
+                        edge            = signal.edge,
+                        size_fraction   = signal.size_fraction,
+                        days_to_expiry  = signal.days_to_expiry,
+                        spot_price      = spot,
+                        neg_risk        = signal.neg_risk,
+                        min_edge        = self._strategy.min_edge,
                     ))
-
-                    if self._notifier:
-                        await self._notifier.send_entry_notification(
-                            market=signal.market_question, held_outcome=signal.held_outcome,
-                            entry_price=signal.market_price, fair_value=signal.fair_value,
-                            edge=signal.edge, size_usdc=size_usdc, size_tokens=size_tokens,
-                            kelly_pct=signal.size_fraction * 100,
-                            days_to_expiry=signal.days_to_expiry,
-                            spot_price=spot, asset=asset, stats=self._registry.stats,
-                        )
-                    self._write_state()   # update bankroll + position count
+                    if not order_id and not self._paper_mode:
+                        log.warning("Order placed but could not extract order id — pending on %s",
+                                    signal.market_question[:60])
                     active.add(signal.market_question)
+                    pending_count += 1
 
                 # Check open positions for resolution every scan
                 await self._check_resolved_positions(markets)
@@ -250,9 +741,17 @@ class PolymarketBot:
         """
         if not self._registry.open_positions:
             return
-        price_map = {m.question: {"YES": m.yes_price,"NO":  m.no_price}for m in markets}
+        price_map = { m.question: { "YES": m.yes_price, "NO":  m.no_price} for m in markets }
         for pos in list(self._registry.open_positions):
             prices = price_map.get(pos.market_question)
+            if not prices and pos.condition_id:
+                try:
+                    market = await self._gamma.get_market_by_condition_id(pos.condition_id)
+                except Exception:
+                    market = None
+                if market:
+                    prices = {"YES": market.yes_price, "NO": market.no_price}
+                    price_map[pos.market_question] = prices
             if not prices:
                 continue
             held_price = prices["YES"] if pos.held_outcome == "YES" else prices["NO"]
@@ -314,6 +813,14 @@ class PolymarketBot:
 
             for pos in open_pos:
                 prices = price_map.get(pos.market_question)
+                if not prices and pos.condition_id:
+                    try:
+                        market = await self._gamma.get_market_by_condition_id(pos.condition_id)
+                    except Exception:
+                        market = None
+                    if market:
+                        prices = {"YES": market.yes_price, "NO": market.no_price}
+                        price_map[pos.market_question] = prices
                 if not prices:
                     log.warning("Could not find live price for %s — leaving open",
                                 pos.market_question[:55])

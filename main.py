@@ -70,16 +70,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Minimum edge threshold to signal a trade (default: 0.05 = 5pp)",
     )
     parser.add_argument(
+        "--bankroll",
+        type=float,
+        default=None,
+        help="Starting bankroll in USDC (default: from .env STARTING_BANKROLL or 500.0)",
+    )
+    parser.add_argument(
         "--max-order",
         type=float,
         default=None,
-        help="Maximum order size in USDC, overrides config (default: from .env)",
+        help="Maximum order size in USDC (default: from .env MAX_ORDER_USDC or 10.0)",
     )
     parser.add_argument(
         "--min-volume",
         type=float,
         default=None,
-        help="Minimum 24h market volume to consider (default: from config, 500.0)",
+        help="Minimum 24h market volume to consider (default: from .env MIN_LIQUIDITY or 200.0)",
     )
     return parser
 
@@ -112,6 +118,8 @@ def main() -> None:
     args   = parser.parse_args()
 
     cfg = Config.from_env()
+    if args.bankroll is not None:
+        cfg = cfg.with_overrides(starting_bankroll=args.bankroll)
     if args.max_order is not None:
         cfg = cfg.with_overrides(max_order_usdc=args.max_order)
     if args.min_volume is not None:
