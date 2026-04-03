@@ -13,28 +13,32 @@ _ASSET_ALIASES: dict[str, str] = {
     "solana": "SOL", "sol": "SOL",
     "xrp": "XRP", "ripple": "XRP",
     "bnb": "BNB", "binance coin": "BNB", "binancecoin": "BNB",
+    "doge": "DOGE", "dogecoin": "DOGE",
+    "avalanche": "AVAX", "avax": "AVAX",
+    "polygon": "MATIC", "matic": "MATIC",
+    "chainlink": "LINK", "link": "LINK",
 }
 
 _PRICE_TARGET_RE = re.compile(
     r"(?:Will\s+)?(?:the\s+price\s+of\s+)?"
-    r"(Bitcoin|Ethereum|Solana|XRP|BNB|BTC|ETH|SOL|Ripple)\s+[^$£\d]*?"
+    r"(Bitcoin|Ethereum|Solana|Avalanche|Polygon|Chainlink|XRP|BNB|BTC|ETH|SOL|AVAX|MATIC|LINK|DOGE|Ripple|Dogecoin)\s+[^$£\d]*?"
     r"(above|below|over|under|reach|exceed|dip\s+to|drop\s+to|fall\s+to|rise\s+to|hit)"
     r"\s*\$?([\d,]+(?:\.\d+)?)",
     re.IGNORECASE,
 )
 _LESS_THAN_RE = re.compile(
     r"(?:Will\s+)?(?:the\s+price\s+of\s+)?"
-    r"(Bitcoin|Ethereum|Solana|XRP|BNB|BTC|ETH|SOL|Ripple)\s+[^$£\d]*?less\s+than\s+\$?([\d,]+(?:\.\d+)?)",
+    r"(Bitcoin|Ethereum|Solana|Avalanche|Polygon|Chainlink|XRP|BNB|BTC|ETH|SOL|AVAX|MATIC|LINK|DOGE|Ripple|Dogecoin)\s+[^$£\d]*?less\s+than\s+\$?([\d,]+(?:\.\d+)?)",
     re.IGNORECASE,
 )
 _BETWEEN_RE = re.compile(
     r"(?:Will\s+)?(?:the\s+price\s+of\s+)?"
-    r"(Bitcoin|Ethereum|Solana|XRP|BNB|BTC|ETH|SOL|Ripple)\s+[^$£\d]*?"
+    r"(Bitcoin|Ethereum|Solana|Avalanche|Polygon|Chainlink|XRP|BNB|BTC|ETH|SOL|AVAX|MATIC|LINK|DOGE|Ripple|Dogecoin)\s+[^$£\d]*?"
     r"between\s+\$?([\d,]+(?:\.\d+)?)\s+and\s+\$?([\d,]+(?:\.\d+)?)",
     re.IGNORECASE,
 )
 _UP_DOWN_RE = re.compile(
-    r"(?:Will\s+)?(Bitcoin|Ethereum|Solana|XRP|BNB|BTC|ETH|SOL|Ripple)\s+[^\d]*?"
+    r"(?:Will\s+)?(Bitcoin|Ethereum|Solana|Avalanche|Polygon|Chainlink|XRP|BNB|BTC|ETH|SOL|AVAX|MATIC|LINK|DOGE|Ripple|Dogecoin)\s+[^\d]*?"
     r"(up|down|rise|drop|fall|gain|lose)\s+([\d]+(?:\.\d+)?)\s*%",
     re.IGNORECASE,
 )

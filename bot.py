@@ -10,6 +10,7 @@ import os
 import time
 from typing import Optional
 
+from analytics import TradeAnalyticsJournal
 from config import Config
 from feeds.binance import BinanceFeed
 from feeds.gamma import GammaClient
@@ -34,17 +35,21 @@ _ASSET_KEYWORDS = {
     "SOL": ["solana", "sol"],
     "XRP": ["xrp", "ripple"],
     "BNB": ["bnb", "binance"],
+    "DOGE": ["doge", "dogecoin"],
+    "AVAX": ["avalanche", "avax"],
+    "MATIC": ["polygon", "matic"],
+    "LINK": ["chainlink", "link"],
 }
 _REPRICE_EPS_ABS = 0.001
 _REPRICE_EPS_REL = 0.02
 
 
-def _extract_asset(question: str) -> str:
+def _extract_asset(question: str) -> Optional[str]:
     ql = question.lower()
     for asset, keywords in _ASSET_KEYWORDS.items():
         if any(k in ql for k in keywords):
             return asset
-    return "BTC"
+    return None
 
 
 class PolymarketBot:
@@ -68,18 +73,28 @@ class PolymarketBot:
         self._registry.load()
         self._order_registry = OrderRegistry()
         self._order_registry.load()
+        self._analytics = TradeAnalyticsJournal(mode="paper" if paper_mode else "live")
 
         self._notifier: Optional[TelegramNotifier] = None
         if os.environ.get("TELEGRAM_TOKEN"):
             self._notifier = TelegramNotifier.from_env()
             self._notifier.paper_mode = paper_mode
+            self._notifier.set_report_provider(self._send_report)
 
         self._exit_mgr = AutoExitManager(
             self._registry, self._orders, self._spot, self._vol, self._notifier,
-            stop_loss_pct=0.70, take_profit_edge=0.02,
+            self._order_registry,
+            analytics=self._analytics,
+            stop_loss_pct=self._cfg.stop_loss_pct, take_profit_edge=0.02,
+            partial_tp_trigger_pct=self._cfg.partial_take_profit_trigger_pct,
+            partial_tp_fraction=self._cfg.partial_take_profit_fraction,
+            time_stop_expiry_progress=self._cfg.time_stop_expiry_progress,
+            time_stop_fair_value_threshold=self._cfg.time_stop_fair_value_threshold,
         )
         self._price_monitor = PriceActionMonitor(self._spot)
         self._price_monitor.add_move_handler(self._on_price_move)
+        self._day_anchor = dt.datetime.now(dt.timezone.utc).date()
+        self._day_start_bankroll = config.starting_bankroll
 
     # ── Scan-only demo ────────────────────────────────────────────────────────
     async def _demo_scan(self) -> None:
@@ -121,6 +136,28 @@ class PolymarketBot:
     @staticmethod
     def _is_local_order_id(order_id: str) -> bool:
         return order_id.startswith("local_")
+
+    def _set_order_status(self, order_id: str, *, note: str = "", **kwargs) -> Optional[OrderRecord]:
+        existing = self._order_registry.get(order_id)
+        old_status = existing.status if existing else None
+        updated = self._order_registry.update(order_id, **kwargs)
+        if updated and "status" in kwargs:
+            self._analytics.log_order_status(
+                order=updated,
+                old_status=old_status,
+                new_status=str(kwargs["status"]),
+                note=note,
+            )
+        return updated
+
+    def _record_entry_fill(self, order: OrderRecord, *, fill_price: float, fill_tokens: float) -> None:
+        new_filled = min(order.filled_tokens + fill_tokens, order.size_tokens)
+        self._analytics.log_entry_fill(
+            order=order,
+            fill_price=fill_price,
+            fill_tokens=fill_tokens,
+            total_filled=new_filled,
+        )
 
     @staticmethod
     def _parse_order_detail(payload: dict) -> tuple[Optional[str], Optional[float], Optional[float]]:
@@ -218,7 +255,7 @@ class PolymarketBot:
                     except Exception as exc:
                         log.warning("Cancel failed for %s: %s", order.order_id, exc)
                         return False
-            self._order_registry.update(order.order_id, status="canceled")
+            self._set_order_status(order.order_id, status="canceled", note="book became non-tradable")
             return True
 
         fair = order.fair_value
@@ -227,13 +264,13 @@ class PolymarketBot:
         min_edge = self._min_edge_for_order(order)
         remaining_tokens = max(order.size_tokens - order.filled_tokens, 0.0)
         if remaining_tokens <= 0:
-            self._order_registry.update(order.order_id, status="filled")
+            self._set_order_status(order.order_id, status="filled", note="order fully allocated before reprice")
             return True
 
         if order.side == "BUY":
             max_price = fair - min_edge
             if max_price <= 0:
-                self._order_registry.update(order.order_id, status="canceled")
+                self._set_order_status(order.order_id, status="canceled", note="fair value no longer supports buy order")
                 return True
             if best_ask is None:
                 return False
@@ -245,7 +282,7 @@ class PolymarketBot:
                         except Exception as exc:
                             log.warning("Cancel failed for %s: %s", order.order_id, exc)
                             return False
-                    self._order_registry.update(order.order_id, status="canceled")
+                    self._set_order_status(order.order_id, status="canceled", note="best ask moved beyond max buy price")
                     return True
                 return False
             new_price = min(best_ask, max_price)
@@ -253,7 +290,7 @@ class PolymarketBot:
         else:
             min_price = fair + min_edge
             if min_price >= 1.0:
-                self._order_registry.update(order.order_id, status="canceled")
+                self._set_order_status(order.order_id, status="canceled", note="fair value no longer supports sell order")
                 return True
             if best_bid is None:
                 return False
@@ -265,7 +302,7 @@ class PolymarketBot:
                         except Exception as exc:
                             log.warning("Cancel failed for %s: %s", order.order_id, exc)
                             return False
-                    self._order_registry.update(order.order_id, status="canceled")
+                    self._set_order_status(order.order_id, status="canceled", note="best bid moved below minimum sell price")
                     return True
                 return False
             new_price = max(best_bid, min_price)
@@ -282,13 +319,13 @@ class PolymarketBot:
         spent_usdc = order.filled_tokens * order.limit_price
         remaining_usdc = max(budget_usdc - spent_usdc, 0.0)
         if remaining_usdc < 1.0:
-            self._order_registry.update(order.order_id, status="canceled")
+            self._set_order_status(order.order_id, status="canceled", note="remaining budget below actionable size")
             return True
 
         max_tokens = remaining_usdc / new_price if new_price > 0 else 0.0
         new_size_tokens = min(remaining_tokens, round(max_tokens, 4))
         if new_size_tokens <= 0:
-            self._order_registry.update(order.order_id, status="canceled")
+            self._set_order_status(order.order_id, status="canceled", note="repriced size rounded to zero")
             return True
 
         if not self._paper_mode and not self._is_local_order_id(order.order_id):
@@ -308,8 +345,8 @@ class PolymarketBot:
             return False
 
         new_order_id = self._extract_order_id(result) or self._local_order_id(order.token_id)
-        self._order_registry.update(order.order_id, status="canceled")
-        self._order_registry.add(OrderRecord(
+        self._set_order_status(order.order_id, status="canceled", note=f"repriced to {new_order_id}")
+        new_order = OrderRecord(
             order_id        = new_order_id,
             market_question = order.market_question,
             token_id        = order.token_id,
@@ -331,7 +368,9 @@ class PolymarketBot:
             spot_price      = order.spot_price,
             neg_risk        = order.neg_risk,
             min_edge        = min_edge,
-        ))
+        )
+        self._order_registry.add(new_order)
+        self._analytics.log_order_placed(order=new_order, stage="reprice")
         log.info("Repriced order %s → %s at %.4f", order.order_id, new_order_id, new_price)
         return True
 
@@ -349,7 +388,7 @@ class PolymarketBot:
             for order in active_orders:
                 age = now - (order.created_ts or now)
                 if age > self._cfg.order_ttl_secs and order.filled_tokens < order.size_tokens:
-                    self._order_registry.update(order.order_id, status="expired")
+                    self._set_order_status(order.order_id, status="expired", note="paper order exceeded ttl")
                     continue
                 try:
                     book = await self._gamma.get_orderbook(order.token_id)
@@ -368,7 +407,7 @@ class PolymarketBot:
 
                 remaining = max(order.size_tokens - order.filled_tokens, 0.0)
                 if remaining <= 0:
-                    self._order_registry.update(order.order_id, status="filled")
+                    self._set_order_status(order.order_id, status="filled", note="paper order fully filled")
                     continue
 
                 filled = 0.0
@@ -398,6 +437,7 @@ class PolymarketBot:
 
                 if filled > 0:
                     fill_price = cost / filled
+                    self._record_entry_fill(order, fill_price=fill_price, fill_tokens=filled)
                     self._registry.add_fill(
                         market_question     = order.market_question,
                         token_id            = order.token_id,
@@ -413,27 +453,31 @@ class PolymarketBot:
                         entry_time          = order.created_ts or time.time(),
                         condition_id        = order.condition_id,
                     )
-                    if self._notifier:
+                    new_filled = min(order.filled_tokens + filled, order.size_tokens)
+                    status = "filled" if new_filled >= order.size_tokens else "partial"
+                    self._set_order_status(
+                        order.order_id,
+                        filled_tokens=new_filled,
+                        status=status,
+                        note="paper reconcile fill",
+                    )
+                    # Only notify once the order is fully filled — not on every partial
+                    # fill batch. This prevents a notification every scan cycle while an
+                    # order is being gradually absorbed from the live book simulation.
+                    if self._notifier and status == "filled":
                         await self._notifier.send_entry_notification(
                             market=order.market_question, held_outcome=order.held_outcome,
                             entry_price=fill_price, fair_value=order.fair_value,
-                            edge=order.edge, size_usdc=filled * fill_price, size_tokens=filled,
+                            edge=order.edge, size_usdc=new_filled * fill_price, size_tokens=new_filled,
                             kelly_pct=order.size_fraction * 100,
                             days_to_expiry=order.days_to_expiry,
                             spot_price=order.spot_price, asset=order.asset,
                             stats=self._registry.stats,
                         )
-                    new_filled = min(order.filled_tokens + filled, order.size_tokens)
-                    status = "filled" if new_filled >= order.size_tokens else "partial"
-                    self._order_registry.update(
-                        order.order_id,
-                        filled_tokens=new_filled,
-                        status=status,
-                    )
                     self._write_state()
                 else:
                     if order.status == "pending":
-                        self._order_registry.update(order.order_id, status="open")
+                        self._set_order_status(order.order_id, status="open", note="paper order resting on book")
             return
 
         now = time.time()
@@ -453,6 +497,7 @@ class PolymarketBot:
                 delta = max(current - order.filled_tokens, 0.0)
                 if delta > 0:
                     fill_price = pos.avg_price if pos.avg_price > 0 else order.limit_price
+                    self._record_entry_fill(order, fill_price=fill_price, fill_tokens=delta)
                     self._registry.add_fill(
                         market_question     = order.market_question,
                         token_id            = order.token_id,
@@ -480,7 +525,7 @@ class PolymarketBot:
                         )
                     self._write_state()
                 status = "filled" if current >= order.size_tokens else "partial"
-                self._order_registry.update(order.order_id, filled_tokens=current, status=status)
+                self._set_order_status(order.order_id, filled_tokens=current, status=status, note="wallet position matched order")
                 continue
 
             age = now - (order.created_ts or now)
@@ -488,11 +533,11 @@ class PolymarketBot:
 
             if order.order_id and order.order_id in open_ids:
                 if order.status == "pending":
-                    self._order_registry.update(order.order_id, status="open")
+                    self._set_order_status(order.order_id, status="open", note="exchange reports order still open")
                 if expired and not self._is_local_order_id(order.order_id):
                     try:
                         self._orders.cancel_order(order.order_id)
-                        self._order_registry.update(order.order_id, status="canceled")
+                        self._set_order_status(order.order_id, status="canceled", note="order ttl exceeded and cancel succeeded")
                     except Exception as exc:
                         log.warning("Cancel failed for %s: %s", order.order_id, exc)
                     continue
@@ -519,6 +564,7 @@ class PolymarketBot:
                         delta = max(filled - order.filled_tokens, 0.0)
                         if delta > 0:
                             fill_price = order.limit_price
+                            self._record_entry_fill(order, fill_price=fill_price, fill_tokens=delta)
                             self._registry.add_fill(
                                 market_question     = order.market_question,
                                 token_id            = order.token_id,
@@ -548,19 +594,20 @@ class PolymarketBot:
                     if status:
                         norm = str(status).lower()
                         if norm in ("filled", "complete", "completed"):
-                            self._order_registry.update(order.order_id, status="filled",
-                                                        filled_tokens=filled or order.filled_tokens)
+                            self._set_order_status(order.order_id, status="filled",
+                                                   filled_tokens=filled or order.filled_tokens,
+                                                   note="exchange reports order filled")
                             continue
                         if norm in ("canceled", "cancelled", "expired", "rejected"):
-                            self._order_registry.update(order.order_id, status="canceled")
+                            self._set_order_status(order.order_id, status="canceled", note=f"exchange reports {norm}")
                             continue
                 except Exception:
                     pass
 
             if expired:
-                self._order_registry.update(order.order_id, status="expired")
+                self._set_order_status(order.order_id, status="expired", note="order ttl exceeded")
             elif now - (order.created_ts or now) > drop_after:
-                self._order_registry.update(order.order_id, status="canceled")
+                self._set_order_status(order.order_id, status="canceled", note="order disappeared from venue after grace period")
 
     # ── Trading loop ──────────────────────────────────────────────────────────
     async def _trading_loop(self, scan_interval: float) -> None:
@@ -578,6 +625,12 @@ class PolymarketBot:
                         log.warning("Could not fetch open orders: %s", exc)
                 await self._reconcile_orders(existing, open_orders)
 
+                # Evaluate exits each scan cycle for all assets with open exposure,
+                # so time-based exits are not dependent on spike alerts.
+                open_assets = {p.asset for p in self._registry.open_positions if p.asset}
+                for asset in open_assets:
+                    await self._exit_mgr.evaluate_all(asset)
+
                 active   = {p.market_title for p in existing}
                 active  |= {p.market_question for p in self._registry.open_positions}
                 # Include closed positions — prevents re-entering a market
@@ -588,13 +641,42 @@ class PolymarketBot:
                 pending_count = len(active_orders)
                 active  |= {o.market_question for o in active_orders}
 
-                # Cap concurrent positions — never deploy more than max_positions
-                max_positions = int(self._cfg.starting_bankroll / self._cfg.max_order_usdc)
+                # Cap concurrent positions relative to current equity
+                current_bankroll = self._cfg.starting_bankroll + sum(
+                    p.realised_pnl for p in self._registry.closed_positions
+                )
+
+                # Reset day anchor at UTC midnight for drawdown checks.
+                now_day = dt.datetime.now(dt.timezone.utc).date()
+                if now_day != self._day_anchor:
+                    self._day_anchor = now_day
+                    self._day_start_bankroll = current_bankroll
+                if self._day_start_bankroll > 0:
+                    dd = (self._day_start_bankroll - current_bankroll) / self._day_start_bankroll
+                    if dd >= self._cfg.daily_max_drawdown_pct:
+                        log.warning(
+                            "Daily drawdown %.2f%% >= %.2f%% — pausing new entries",
+                            dd * 100,
+                            self._cfg.daily_max_drawdown_pct * 100,
+                        )
+                        await self._check_resolved_positions(markets)
+                        await asyncio.sleep(scan_interval)
+                        continue
+
+                max_positions = int(current_bankroll / self._cfg.max_order_usdc)
                 max_positions = max(5, min(max_positions, 15))  # floor 5, cap 15
                 if (len(self._registry.open_positions) + pending_count) >= max_positions:
                     log.info("Max positions (%d) reached — skipping scan", max_positions)
-                    break
+                    continue
 
+                asset_exposure: dict[str, int] = {}
+                for pos in self._registry.open_positions:
+                    asset_exposure[pos.asset] = asset_exposure.get(pos.asset, 0) + 1
+                for order in active_orders:
+                    if order.asset:
+                        asset_exposure[order.asset] = asset_exposure.get(order.asset, 0) + 1
+
+                candidates: list[tuple[float, object, object, str]] = []
                 for market in markets:
                     if market.question in active:
                         continue
@@ -603,25 +685,87 @@ class PolymarketBot:
                     if max(market.yes_price, market.no_price) >= 0.995 or \
                        min(market.yes_price, market.no_price) <= 0.005:
                         continue
-                    if (len(self._registry.open_positions) + pending_count) >= max_positions:
-                        break
                     signal = await self._strategy.evaluate(market)
                     if signal is None:
                         continue
-
-                    size_usdc   = self._cfg.max_order_usdc * signal.size_fraction
-                    size_usdc   = round(max(size_usdc, 1.0), 4)  # Polymarket min order = $1
-                    if size_usdc > self._cfg.max_order_usdc:
-                        log.debug("Signal sized below $1 after Kelly — skipping")
+                    asset = _extract_asset(signal.market_question)
+                    if asset is None:
+                        log.warning("Could not determine asset — skipping: %s",
+                                    signal.market_question[:60])
                         continue
-                    size_tokens = round(size_usdc / signal.market_price, 4)
-                    asset       = _extract_asset(signal.market_question)
-                    spot        = self._spot.price(asset) or 0.0
+                    if asset_exposure.get(asset, 0) >= self._cfg.max_positions_per_asset:
+                        continue
+                    # Prioritize high edge, short-dated signals, then liquidity.
+                    time_penalty = max(signal.days_to_expiry, 1.0)
+                    liquidity_boost = min(max(market.volume_24h / 1000.0, 0.5), 3.0)
+                    score = (signal.edge * liquidity_boost) / time_penalty
+                    candidates.append((score, market, signal, asset))
+
+                ranked = sorted(candidates, key=lambda x: x[0], reverse=True)
+                ranked = ranked[:max(self._cfg.max_entries_per_scan, 1)]
+
+                for _, market, signal, asset in ranked:
+                    if (len(self._registry.open_positions) + pending_count) >= max_positions:
+                        break
+                    if asset_exposure.get(asset, 0) >= self._cfg.max_positions_per_asset:
+                        continue
+
+                    size_usdc = self._cfg.max_order_usdc * signal.size_fraction
+                    size_usdc = round(max(size_usdc, 1.0), 4)  # Polymarket min order = $1
+                    spot = self._spot.price(asset) or 0.0
+
+                    # Guard: cap order size to available balance
+                    deployed = sum(p.size_usdc for p in self._registry.open_positions)
+                    available = current_bankroll - deployed
+                    size_usdc = round(min(size_usdc, available), 4)
+                    if size_usdc < 1.0:
+                        log.info("Insufficient balance ($%.2f available) — skipping order", available)
+                        continue
+
+                    order_price = signal.market_price
+                    try:
+                        book = await self._gamma.get_orderbook(signal.token_id)
+                    except Exception as exc:
+                        log.debug("Orderbook fetch failed, using market price: %s", exc)
+                        book = {}
+
+                    asks = self._parse_book_levels(book.get("asks") if isinstance(book, dict) else None)
+                    bids = self._parse_book_levels(book.get("bids") if isinstance(book, dict) else None)
+                    best_ask = min((p for p, _ in asks), default=None)
+                    best_bid = max((p for p, _ in bids), default=None)
+
+                    if best_ask is not None and best_bid is not None and best_ask >= best_bid:
+                        spread = best_ask - best_bid
+                        if spread > self._cfg.max_spread_pct:
+                            log.info("Spread %.3f > max %.3f — skipping %s",
+                                     spread, self._cfg.max_spread_pct, signal.market_question[:55])
+                            continue
+                        if spread > (2.0 * signal.edge):
+                            log.info("Spread %.3f exceeds 2x edge %.3f — skipping %s",
+                                     spread, signal.edge, signal.market_question[:55])
+                            continue
+
+                    tick = max(self._cfg.maker_price_tick, 0.0001)
+                    max_buy_price = signal.fair_value - self._strategy.min_edge
+                    if max_buy_price <= 0:
+                        continue
+                    order_price = min(order_price, max_buy_price)
+                    if best_bid is not None:
+                        order_price = min(order_price, best_bid + tick)
+                    if best_ask is not None and order_price >= best_ask:
+                        order_price = max(best_ask - tick, 0.0001)
+                    order_price = round(order_price, 4)
+
+                    edge_at_order = signal.fair_value - order_price
+                    if edge_at_order < self._strategy.min_edge:
+                        continue
+
+                    size_tokens = round(size_usdc / order_price, 4)
 
                     try:
                         result = self._orders.place_limit_order(
                             token_id=signal.token_id, side=signal.side,
-                            price=signal.market_price, size_usdc=size_usdc,
+                            price=order_price, size_usdc=size_usdc,
                             neg_risk=signal.neg_risk,
                         )
                     except Exception as exc:
@@ -631,13 +775,13 @@ class PolymarketBot:
                     order_id = self._extract_order_id(result)
                     if not order_id:
                         order_id = self._local_order_id(signal.token_id)
-                    self._order_registry.add(OrderRecord(
+                    new_order = OrderRecord(
                         order_id        = order_id,
                         market_question = signal.market_question,
                         token_id        = signal.token_id,
                         held_outcome    = signal.held_outcome,
                         side            = signal.side,
-                        limit_price     = signal.market_price,
+                        limit_price     = order_price,
                         size_tokens     = size_tokens,
                         size_usdc       = size_usdc,
                         filled_tokens   = 0.0,
@@ -647,17 +791,32 @@ class PolymarketBot:
                         asset           = asset,
                         end_date        = market.end_date,
                         fair_value      = signal.fair_value,
-                        edge            = signal.edge,
+                        edge            = edge_at_order,
                         size_fraction   = signal.size_fraction,
                         days_to_expiry  = signal.days_to_expiry,
                         spot_price      = spot,
                         neg_risk        = signal.neg_risk,
                         min_edge        = self._strategy.min_edge,
-                    ))
+                    )
+                    self._order_registry.add(new_order)
+                    self._analytics.log_order_placed(order=new_order, stage="entry")
+                    if self._notifier:
+                        await self._notifier.send_order_placed_notification(
+                            market=signal.market_question,
+                            held_outcome=signal.held_outcome,
+                            side=signal.side,
+                            order_price=order_price,
+                            size_usdc=size_usdc,
+                            size_tokens=size_tokens,
+                            order_id=order_id,
+                            stage="entry",
+                            reason="Signal passed edge, spread, and risk checks",
+                        )
                     if not order_id and not self._paper_mode:
                         log.warning("Order placed but could not extract order id — pending on %s",
                                     signal.market_question[:60])
                     active.add(signal.market_question)
+                    asset_exposure[asset] = asset_exposure.get(asset, 0) + 1
                     pending_count += 1
 
                 # Check open positions for resolution every scan
@@ -669,6 +828,67 @@ class PolymarketBot:
             await asyncio.sleep(scan_interval)
 
     # ── Daily summary ─────────────────────────────────────────────────────────
+    async def _build_report_payload(self) -> dict:
+        cutoff = time.time() - 86400
+        closed_pos = self._registry.closed_positions
+        closed_today = [
+            {"market": p.market_question, "pnl": p.realised_pnl, "reason": p.exit_reason or "?"}
+            for p in closed_pos
+            if p.exit_time and p.exit_time >= cutoff
+        ]
+
+        open_pos_list = self._registry.open_positions
+        live_pmap: dict[str, dict[str, float]] = {}
+        try:
+            open_qs = [p.market_question for p in open_pos_list]
+            async with aiohttp.ClientSession() as _sess:
+                async with _sess.get(
+                    self._cfg.gamma_url + "/markets",
+                    params={"active": "true", "closed": "false", "limit": 500},
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as _resp:
+                    raw = await _resp.json()
+            for market in raw:
+                question = market.get("question", "")
+                if question not in open_qs:
+                    continue
+                raw_prices = market.get("outcomePrices", "[0.5,0.5]")
+                prices = json.loads(raw_prices) if isinstance(raw_prices, str) else raw_prices
+                live_pmap[question] = {"YES": float(prices[0]), "NO": float(prices[1])}
+        except Exception:
+            pass
+
+        open_dicts = []
+        total_u_pnl = 0.0
+        for pos in open_pos_list:
+            prices = live_pmap.get(pos.market_question)
+            if prices and isinstance(prices, dict):
+                mark = prices["YES"] if pos.held_outcome == "YES" else prices["NO"]
+            else:
+                mark = pos.entry_price
+            upnl = (mark - pos.entry_price) * pos.size_tokens
+            total_u_pnl += upnl
+            open_dicts.append({"market": pos.market_question, "unrealised_pnl": round(upnl, 4)})
+
+        wins = [p for p in closed_pos if p.realised_pnl > 0]
+        return {
+            "open_positions": open_dicts,
+            "closed_today": closed_today,
+            "total_realised_pnl": sum(p.realised_pnl for p in closed_pos),
+            "total_unrealised_pnl": round(total_u_pnl, 4),
+            "win_rate": len(wins) / len(closed_pos) if closed_pos else None,
+            "bankroll": self._cfg.starting_bankroll + sum(p.realised_pnl for p in closed_pos),
+            "deployed": sum(p.size_usdc for p in open_pos_list),
+            "stats": self._registry.stats,
+            "analytics_summary": self._analytics.get_summary(),
+        }
+
+    async def _send_report(self) -> None:
+        if not self._notifier:
+            return
+        payload = await self._build_report_payload()
+        await self._notifier.send_daily_summary(**payload)
+
     async def _daily_summary_loop(self) -> None:
         while True:
             now      = dt.datetime.now(dt.timezone.utc)
@@ -679,56 +899,7 @@ class PolymarketBot:
             if not self._notifier:
                 continue
             try:
-                cutoff      = time.time() - 86400
-                closed_pos  = self._registry.closed_positions
-                closed_today = [{"market": p.market_question, "pnl": p.realised_pnl,
-                                 "reason": p.exit_reason or "?"} for p in closed_pos
-                                if p.exit_time and p.exit_time >= cutoff]
-                # Fetch live prices for unrealised P&L calculation
-                open_pos_list = self._registry.open_positions
-                live_pmap: dict[str, float] = {}
-                try:
-                    open_qs = [p.market_question for p in open_pos_list]
-                    async with aiohttp.ClientSession() as _sess:
-                        async with _sess.get(
-                            "https://gamma-api.polymarket.com/markets",
-                            params={"active": "true", "closed": "false", "limit": 500},
-                            timeout=aiohttp.ClientTimeout(total=5),
-                        ) as _resp:
-                            _raw = await _resp.json()
-                    import json as _json
-                    for _m in _raw:
-                        _q = _m.get("question", "")
-                        if _q in open_qs:
-                            _rp = _m.get("outcomePrices", "[0.5,0.5]")
-                            _p  = _json.loads(_rp) if isinstance(_rp, str) else _rp
-                            live_pmap[_q] = {"YES": float(_p[0]), "NO": float(_p[1])}
-                except Exception:
-                    pass
-
-                open_dicts = []
-                total_u_pnl = 0.0
-                for p in open_pos_list:
-                    prices = live_pmap.get(p.market_question)
-                    if prices and isinstance(prices, dict):
-                        mark = prices["YES"] if p.held_outcome == "YES" else prices["NO"]
-                    else:
-                        mark = p.entry_price
-                    upnl   = (mark - p.entry_price) * p.size_tokens
-                    total_u_pnl += upnl
-                    open_dicts.append({"market": p.market_question, "unrealised_pnl": round(upnl, 4)})
-
-                wins = [p for p in closed_pos if p.realised_pnl > 0]
-                await self._notifier.send_daily_summary(
-                    open_positions      = open_dicts,
-                    closed_today        = closed_today,
-                    total_realised_pnl  = sum(p.realised_pnl for p in closed_pos),
-                    total_unrealised_pnl= round(total_u_pnl, 4),
-                    win_rate            = len(wins) / len(closed_pos) if closed_pos else None,
-                    bankroll            = self._cfg.starting_bankroll + sum(p.realised_pnl for p in closed_pos),
-                    deployed            = sum(p.size_usdc for p in open_pos_list),
-                    stats               = self._registry.stats,
-                )
+                await self._send_report()
             except Exception as exc:
                 log.error("Daily summary error: %s", exc)
 
@@ -756,26 +927,26 @@ class PolymarketBot:
                 continue
             held_price = prices["YES"] if pos.held_outcome == "YES" else prices["NO"]
             if held_price >= 0.97:
-                closed = self._registry.close(pos.market_question, 1.0, "resolved_win")
+                closed = self._registry.close(pos.market_question, held_price, "resolved_win")
                 log.info("RESOLVED WIN: %s", pos.market_question[:60])
                 if self._notifier and closed:
                     await self._notifier.send_take_profit_notification(
                         market=closed.market_question, held_outcome=closed.held_outcome,
-                        entry_price=closed.entry_price, exit_price=1.0,
-                        fair_value_now=1.0, size_usdc=closed.size_usdc,
+                        entry_price=closed.entry_price, exit_price=held_price,
+                        fair_value_now=held_price, size_usdc=closed.size_usdc,
                         pnl=closed.realised_pnl, pnl_pct=closed.return_pct,
                         edge_at_entry=closed.edge_at_entry, edge_now=0.0,
                         stats=self._registry.stats,
                     )
                 self._write_state()
             elif held_price <= 0.03:
-                closed = self._registry.close(pos.market_question, 0.0, "resolved_loss")
+                closed = self._registry.close(pos.market_question, held_price, "resolved_loss")
                 log.info("RESOLVED LOSS: %s", pos.market_question[:60])
                 if self._notifier and closed:
                     await self._notifier.send_stop_loss_notification(
                         market=closed.market_question, held_outcome=closed.held_outcome,
-                        entry_price=closed.entry_price, exit_price=0.0,
-                        fair_value_now=0.0, size_usdc=closed.size_usdc,
+                        entry_price=closed.entry_price, exit_price=held_price,
+                        fair_value_now=held_price, size_usdc=closed.size_usdc,
                         pnl=closed.realised_pnl, pnl_pct=closed.return_pct,
                         reason="Market resolved against position",
                         stats=self._registry.stats,
@@ -797,7 +968,7 @@ class PolymarketBot:
             questions = [p.market_question for p in open_pos]
             async with aiohttp.ClientSession() as session:
                 async with session.get(
-                    "https://gamma-api.polymarket.com/markets",
+                    self._cfg.gamma_url + "/markets",
                     params={"active": "true", "closed": "false",
                             "limit": 500, "order": "volume24hr", "ascending": "false"},
                     timeout=aiohttp.ClientTimeout(total=8),
@@ -830,20 +1001,20 @@ class PolymarketBot:
                 no_p  = prices.get("NO",  0.5)
                 held_price = yes_p if pos.held_outcome == "YES" else no_p
                 if held_price >= 0.97:
-                    self._registry.close(pos.market_question, 1.0, "resolved_win")
+                    self._registry.close(pos.market_question, held_price, "resolved_win")
                     log.info("RECONCILED WIN: %s", pos.market_question[:60])
                     if self._notifier:
-                        pnl_win = pos.size_usdc * (1.0 - pos.entry_price)
+                        pnl_win = (held_price - pos.entry_price) * pos.size_tokens
                         msg = (f"*Position resolved while bot was offline*\n\n"
                                f"*{pos.market_question[:70]}*\n"
                                f"Held {pos.held_outcome} — WON\n"
                                f"P&L: `+${pnl_win:.2f}`")
                         await self._notifier.send(msg)
                 elif held_price <= 0.03:
-                    self._registry.close(pos.market_question, 0.0, "resolved_loss")
+                    self._registry.close(pos.market_question, held_price, "resolved_loss")
                     log.info("RECONCILED LOSS: %s", pos.market_question[:60])
                     if self._notifier:
-                        pnl_loss = pos.entry_price * pos.size_tokens
+                        pnl_loss = (pos.entry_price - held_price) * pos.size_tokens
                         msg = (f"*Position resolved while bot was offline*\n\n"
                                f"*{pos.market_question[:70]}*\n"
                                f"Held {pos.held_outcome} — LOST\n"
@@ -909,6 +1080,21 @@ class PolymarketBot:
     async def run(self, *, trading_enabled: bool = False, scan_interval: int = 60) -> None:
         mode = "PAPER" if self._paper_mode else "LIVE"
         log.info("PolymarketBot starting (mode=%s trading=%s)", mode, trading_enabled)
+        self._analytics.log_event(
+            "session_start",
+            trading_enabled=trading_enabled,
+            scan_interval=scan_interval,
+            analytics_file=str(self._analytics.path),
+            analytics_summary_file=str(self._analytics.summary_path),
+            min_liquidity=self._cfg.min_liquidity,
+            max_order_usdc=self._cfg.max_order_usdc,
+            stop_loss_pct=self._cfg.stop_loss_pct,
+            partial_take_profit_trigger_pct=self._cfg.partial_take_profit_trigger_pct,
+            partial_take_profit_fraction=self._cfg.partial_take_profit_fraction,
+            time_stop_expiry_progress=self._cfg.time_stop_expiry_progress,
+            time_stop_fair_value_threshold=self._cfg.time_stop_fair_value_threshold,
+            min_edge=self._strategy.min_edge,
+        )
         self._write_state()   # write initial state so dashboard is ready immediately
 
         if not trading_enabled:
@@ -921,8 +1107,15 @@ class PolymarketBot:
         tokens    = [m.yes_token_id for m in markets[:5]]
 
         if self._notifier:
-            await self._notifier.start()
-            log.info("Telegram active — all trades will be notified")
+            try:
+                await self._notifier.start()
+                log.info("Telegram active — all trades will be notified")
+            except Exception as exc:
+                # Mask token in error message for secure logging
+                import re
+                masked_exc = re.sub(r'\d+:[A-Za-z0-9_-]+', '/telegram_token', str(exc))
+                log.warning("Telegram unavailable — continuing without notifier: %s", masked_exc)
+                self._notifier = None
 
         try:
             await asyncio.gather(
@@ -932,6 +1125,14 @@ class PolymarketBot:
                 feed_task,
             )
         finally:
+            self._analytics.log_event(
+                "session_stop",
+                trading_enabled=trading_enabled,
+                open_positions=len(self._registry.open_positions),
+                closed_positions=len(self._registry.closed_positions),
+                total_trades=self._registry.stats.total_trades,
+                total_pnl=self._registry.stats.total_pnl,
+            )
             self._write_state()   # final state write so dashboard shows correct data
             if self._notifier:
                 await self._notifier.stop()

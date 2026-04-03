@@ -9,7 +9,7 @@ import aiohttp
 
 log = logging.getLogger(__name__)
 
-_DEFAULTS     = {"BTC": 0.65, "ETH": 0.72, "SOL": 0.90, "XRP": 1.10, "BNB": 0.85}
+_DEFAULTS     = {"BTC": 0.65, "ETH": 0.72, "SOL": 0.90, "XRP": 1.10, "BNB": 0.85, "DOGE": 0.95, "AVAX": 0.80, "MATIC": 1.05, "LINK": 0.85}
 _DERIBIT_URL  = "https://www.deribit.com/api/v2/public/get_volatility_index_data"
 _BINANCE_INFO = "https://eapi.binance.com/eapi/v1/exchangeInfo"
 _BINANCE_MARK = "https://eapi.binance.com/eapi/v1/mark"
@@ -18,9 +18,9 @@ _REFRESH_SECS = 300
 
 class VolatilityFeed:
     """
-    Fetches real implied volatility for BTC/ETH/SOL/XRP/BNB.
+    Fetches real implied volatility for BTC/ETH/SOL/XRP/BNB/DOGE/AVAX/MATIC/LINK.
     BTC and ETH: Deribit DVOL blended with Binance ATM options.
-    SOL, XRP, BNB: Binance ATM options directly.
+    Others: Binance ATM options directly.
     Falls back to conservative defaults on any failure.
     """
 
@@ -66,7 +66,7 @@ class VolatilityFeed:
 
     async def _refresh_binance(self, session: aiohttp.ClientSession) -> None:
         symbols = await self._fetch_symbols(session)
-        for asset in ("BTC", "ETH", "SOL", "XRP", "BNB"):
+        for asset in ("BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "AVAX", "MATIC", "LINK"):
             iv = await self._fetch_atm_iv(session, asset, symbols.get(asset, []))
             if not iv:
                 continue
@@ -95,7 +95,7 @@ class VolatilityFeed:
                 continue
             exp_ms     = int(sym.get("expiryDate", 0))
             underlying = sym.get("underlying", "").replace("USDT", "")
-            if underlying in _DEFAULTS and (now_ms + 14 * day_ms) <= exp_ms <= (now_ms + 45 * day_ms):
+            if underlying in _DEFAULTS and (now_ms + 2 * day_ms) <= exp_ms <= (now_ms + 45 * day_ms):
                 result.setdefault(underlying, []).append(sym["symbol"])
         return result
 
@@ -112,7 +112,7 @@ class VolatilityFeed:
                 ) as resp:
                     marks = await resp.json()
                 for m in (marks if isinstance(marks, list) else [marks]):
-                    raw = m.get("markIV") or m.get("markPrice")
+                    raw = m.get("markIV")
                     if raw and float(raw) > 0:
                         ivs.append(float(raw))
             except Exception:

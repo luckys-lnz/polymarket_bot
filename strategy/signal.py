@@ -16,6 +16,46 @@ log = logging.getLogger(__name__)
 _MIN_DAYS     = 2      # minimum days to expiry
 _MAX_SIGMAS   = 2.5    # reject outcomes requiring > 2.5σ move
 _MAX_DAILY_MOVE_PCT = 8.0  # max plausible daily % move for crypto
+_CRYPTO_TAKER_FEE_RATE = 0.072
+
+
+def _find_related_markets(question: str, all_markets: dict[str, str]) -> list[str]:
+    """
+    Identify related markets for multi-outcome support.
+    E.g., if the question is about price between $50k-$60k, find adjacent ranges.
+    Returns list of related market questions.
+    """
+    related = []
+    # Extract asset and price range if this is a "between" market
+    parsed = parse_market_question(question, "2099-12-31T23:59:59Z")
+    if parsed and parsed.market_type == "between" and parsed.asset:
+        asset = parsed.asset
+        low = parsed.strike
+        high = parsed.strike_high
+        range_size = high - low
+
+        # Look for adjacent ranges (one tick above and below)
+        for other_q in all_markets.keys():
+            if other_q == question:
+                continue
+            other = parse_market_question(other_q, "2099-12-31T23:59:59Z")
+            if (other and other.market_type == "between" and other.asset == asset
+                and other.days_to_expiry and parsed.days_to_expiry
+                and abs(other.days_to_expiry - parsed.days_to_expiry) < 1.0):
+                # Check if adjacent range
+                if abs(other.strike - high) < 0.01 and abs(other.strike_high - (high + range_size)) < 0.01:
+                    related.append(other_q)
+                elif abs(other.strike_high - low) < 0.01 and abs(other.strike - (low - range_size)) < 0.01:
+                    related.append(other_q)
+
+    return related
+
+
+def _taker_fee_pct(price: float) -> float:
+    """Approximate taker fee as fraction of deployed capital for crypto markets."""
+    if price <= 0.0 or price >= 1.0:
+        return 0.0
+    return _CRYPTO_TAKER_FEE_RATE * price * (1.0 - price)
 
 
 def _kelly_fraction(edge: float, max_fraction: float = 0.25) -> float:
@@ -63,6 +103,25 @@ class CryptoStrategy:
     @property
     def min_edge(self) -> float:
         return self._min_edge
+
+    def _vol_regime_adjusted_edge(self, asset: str, sigma: float) -> float:
+        """
+        Adjust minimum edge threshold based on realized vol regime.
+        High vol environments require higher edge (more slippage risk).
+        Low vol environments allow lower edge (market more efficient).
+        """
+        regime = self._spot.vol_regime(asset, sigma)
+        base_edge = self._min_edge
+
+        if regime == "high_vol":
+            # High vol: increase required edge by 50% (e.g., 5% → 7.5%)
+            return base_edge * 1.5
+        elif regime == "low_vol":
+            # Low vol: decrease required edge by 20% (e.g., 5% → 4%)
+            return base_edge * 0.8
+        else:
+            # Normal vol: use base threshold
+            return base_edge
 
     async def evaluate(self, market: Market) -> Optional[TradeSignal]:
         if market.volume_24h < self._min_vol:
@@ -112,7 +171,9 @@ class CryptoStrategy:
             fair_yes, yes_price, yes_edge,
         )
 
-        if abs(yes_edge) < self._min_edge:
+        # Adjust min edge based on realized vol regime
+        vol_regime_threshold = self._vol_regime_adjusted_edge(parsed.asset, sigma)
+        if abs(yes_edge) < vol_regime_threshold:
             return None
 
         # Reject deep OTM outcomes requiring > 2.5 sigma move
@@ -136,6 +197,13 @@ class CryptoStrategy:
             held_outcome, token_id, market_price, fair_value = "NO",  market.no_token_id,  no_price,  fair_no
 
         edge = fair_value - market_price
+        fee_pct = _taker_fee_pct(market_price)
+        net_edge = edge - fee_pct
+
+        # Use vol regime-adjusted threshold for final edge check
+        vol_regime_threshold = self._vol_regime_adjusted_edge(parsed.asset, sigma)
+        if net_edge < vol_regime_threshold:
+            return None
 
         # Reject near-zero noise signals
         if fair_value < 0.05 and market_price < 0.05:
@@ -148,12 +216,14 @@ class CryptoStrategy:
             side             = "BUY",
             market_price     = market_price,
             fair_value       = fair_value,
-            edge             = edge,
+            edge             = net_edge,
             market_yes_price = yes_price,
             market_no_price  = no_price,
             fair_yes_value   = fair_yes,
             fair_no_value    = fair_no,
-            size_fraction    = _kelly_fraction(edge, self._max_kelly),
+            size_fraction    = _kelly_fraction(net_edge, self._max_kelly),
             neg_risk         = market.neg_risk,
             days_to_expiry   = parsed.days_to_expiry,
+            market_type      = parsed.market_type,
+            related_markets  = [],
         )

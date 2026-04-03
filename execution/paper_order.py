@@ -33,7 +33,7 @@ class PaperOrderManager:
 
     def place_limit_order(self, *, token_id: str, side: str,
                           price: float, size_usdc: float, neg_risk: bool = False) -> dict:
-        size_usdc   = min(size_usdc, self._cfg.max_order_usdc)
+        size_usdc = min(size_usdc, self._cfg.max_order_usdc)
         size_tokens = round(size_usdc / price, 4)
         order_id    = self._next_id()
         log.info("[PAPER] LIMIT %s  token=%s…  price=%.4f  $%.2f  → %s",

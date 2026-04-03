@@ -23,6 +23,7 @@ from rich.text import Text
 
 # ── Files ─────────────────────────────────────────────────────────────────────
 REGISTRY_FILE = Path("position_registry.json")
+ORDER_FILE    = Path("order_registry.json")
 STATE_FILE    = Path(".bot_state")
 GAMMA_URL     = "https://gamma-api.polymarket.com/markets"
 
@@ -71,6 +72,14 @@ def _load_positions() -> list[dict]:
         return []
     try:
         return json.loads(REGISTRY_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+
+def _load_orders() -> list[dict]:
+    if not ORDER_FILE.is_file():
+        return []
+    try:
+        return json.loads(ORDER_FILE.read_text())
     except (json.JSONDecodeError, OSError):
         return []
 
@@ -170,12 +179,18 @@ def _header() -> Panel:
     bot_running = STATE_FILE.is_file()
     dot   = Text(f"● {mode}", style=f"bold {_GREEN if mode == 'LIVE' else _YELLOW}") if bot_running             else Text("● OFFLINE", style=f"bold {_RED}")
 
-    # File freshness indicator
-    try:
-        age     = time.time() - REGISTRY_FILE.stat().st_mtime
+    # File freshness indicator (latest of state/orders/positions)
+    stamps = []
+    for p in (STATE_FILE, ORDER_FILE, REGISTRY_FILE):
+        try:
+            stamps.append(p.stat().st_mtime)
+        except OSError:
+            continue
+    if stamps:
+        age = time.time() - max(stamps)
         age_col = "#4ade80" if age < 10 else ("#facc15" if age < 30 else "#f87171")
         age_str = f"  ⟳ {age:.0f}s"
-    except OSError:
+    else:
         age_col, age_str = "#f87171", "  ⟳ no file"
 
     g = Table.grid(expand=True, padding=(0, 1))
@@ -204,8 +219,10 @@ def _card(label: str, value: str, sub: str = "", val_style: str = _WHITE) -> Pan
     )
 
 def _metrics(positions: list[dict], width: int) -> Group | Columns:
+    orders   = _load_orders()
     open_p   = [p for p in positions if not p.get("exit_price")]
     closed_p = [p for p in positions if p.get("exit_price")]
+    pending_orders = [o for o in orders if o.get("status") in ("pending", "open", "partial")]
 
     # Bankroll comes exclusively from .bot_state written by main.py
     # No static fallback — if the bot isn't running we show — not a fake number
@@ -241,7 +258,9 @@ def _metrics(positions: list[dict], width: int) -> Group | Columns:
               f"{win_rate*100:.0f}%" if win_rate is not None else "—",
               f"{wins}W / {len(closed_p)-wins}L" if closed_p else "no closed trades",
               _GREEN if (win_rate or 0) >= 0.55 else (_YELLOW if (win_rate or 0) >= 0.45 else _RED)),
-        _card("AVG EDGE",       f"+{avg_edge*100:.1f}pp",
+          _card("ORDERS",         str(len(pending_orders)),
+              f"pending/open/partial", _YELLOW if pending_orders else _DIM),
+          _card("AVG EDGE",       f"+{avg_edge*100:.1f}pp",
               f"{len(open_p)} open positions", _edge_style(avg_edge)),
     ]
 
@@ -264,7 +283,103 @@ def _metric_rows(width: int) -> int:
         per_row = 3
     else:
         per_row = 6
-    return (6 + per_row - 1) // per_row
+    return (7 + per_row - 1) // per_row
+
+
+def _orders_table(width: int) -> Panel:
+    orders = _load_orders()
+    active = [o for o in orders if o.get("status") in ("pending", "open", "partial")]
+    active = sorted(active, key=lambda x: x.get("updated_ts", x.get("created_ts", 0)), reverse=True)[:12]
+
+    if not active:
+        return Panel(
+            Text("No active orders", style=_DIM, justify="center"),
+            title=Text("ACTIVE ORDERS", style=f"bold {_DIM}"),
+            title_align="left",
+            style=f"on {_BG}",
+            border_style=_BORDER,
+        )
+
+    t = Table(box=box.SIMPLE_HEAD, show_edge=False, expand=True,
+              header_style=f"bold {_DIM}", style=f"on {_BG2}",
+              row_styles=[f"on {_BG2}", f"on {_BG}"])
+    t.add_column("Market", ratio=4, no_wrap=True)
+    t.add_column("Side", width=5, justify="center")
+    t.add_column("Limit", width=7, justify="right")
+    t.add_column("Size", width=8, justify="right")
+    t.add_column("Filled", width=8, justify="right")
+    t.add_column("Status", width=8, justify="center")
+
+    for o in active:
+        status = str(o.get("status", "pending"))
+        status_style = _YELLOW if status in ("pending", "open") else (_CYAN if status == "partial" else _DIM)
+        t.add_row(
+            Text(_shorten(o.get("market_question", "?"), 42), style=_WHITE),
+            Text(str(o.get("side", "BUY"))[:4], style=_GREEN if o.get("side") == "BUY" else _RED),
+            Text(f"{float(o.get('limit_price', 0)):.3f}", style=_DIM),
+            Text(f"${float(o.get('size_usdc', 0)):.2f}", style=_WHITE),
+            Text(f"{float(o.get('filled_tokens', 0)):.2f}", style=_CYAN),
+            Text(status.upper(), style=status_style),
+        )
+
+    return Panel(
+        t,
+        title=Text(f"ACTIVE ORDERS  ({len(active)})", style=f"bold {_DIM}"),
+        title_align="left",
+        style=f"on {_BG}",
+        border_style=_BORDER,
+        padding=(0, 0),
+    )
+
+
+def _activity_report(positions: list[dict]) -> Panel:
+    orders = _load_orders()
+    closed = [p for p in positions if p.get("exit_price")]
+
+    placed = len([o for o in orders if o.get("side") == "BUY"])
+    entered = len(positions)
+    active_orders = len([o for o in orders if o.get("status") in ("pending", "open", "partial")])
+    filled_orders = len([o for o in orders if o.get("status") == "filled"])
+    expired_orders = len([o for o in orders if o.get("status") == "expired"])
+
+    tp = len([p for p in closed if p.get("exit_reason") == "take_profit"])
+    sl = len([p for p in closed if p.get("exit_reason") == "stop_loss"])
+    ts = len([p for p in closed if p.get("exit_reason") == "time_stop"])
+    rw = len([p for p in closed if p.get("exit_reason") == "resolved_win"])
+    rl = len([p for p in closed if p.get("exit_reason") == "resolved_loss"])
+    partial_tp = len([p for p in positions if p.get("partial_tp_done")])
+
+    g = Table.grid(expand=True, padding=(0, 2))
+    for _ in range(8):
+        g.add_column()
+
+    g.add_row(
+        Text("Placed", style=_DIM), Text(str(placed), style=_WHITE),
+        Text("Entered", style=_DIM), Text(str(entered), style=_GREEN),
+        Text("Active orders", style=_DIM), Text(str(active_orders), style=_YELLOW),
+        Text("Filled orders", style=_DIM), Text(str(filled_orders), style=_CYAN),
+    )
+    g.add_row(
+        Text("Take profit", style=_DIM), Text(str(tp), style=_GREEN),
+        Text("Stop loss", style=_DIM), Text(str(sl), style=_RED),
+        Text("Time stop", style=_DIM), Text(str(ts), style=_YELLOW),
+        Text("Partial TP", style=_DIM), Text(str(partial_tp), style=_CYAN),
+    )
+    g.add_row(
+        Text("Resolved win", style=_DIM), Text(str(rw), style=_GREEN),
+        Text("Resolved loss", style=_DIM), Text(str(rl), style=_RED),
+        Text("Expired orders", style=_DIM), Text(str(expired_orders), style=_MUTED),
+        Text("", style=_DIM), Text("", style=_DIM),
+    )
+
+    return Panel(
+        g,
+        title=Text("TRADE ACTIVITY REPORT", style=f"bold {_DIM}"),
+        title_align="left",
+        style=f"on {_BG2}",
+        border_style=_BORDER,
+        padding=(0, 1),
+    )
 
 
 # ── UI: P&L bars ─────────────────────────────────────────────────────────────
@@ -462,15 +577,19 @@ def _build(positions: list[dict], width: int, height: int) -> Layout:
             Layout(name="header",    size=3),
             Layout(name="metrics",   size=metrics_h),
             Layout(name="bars",      size=bars_h),
+            Layout(name="orders",    ratio=1),
             Layout(name="open",      ratio=1),
             Layout(name="closed",    ratio=1),
+            Layout(name="activity",  size=8),
             Layout(name="scorecard", size=7),
         )
         layout["header"].update(_header())
         layout["metrics"].update(_metrics(positions, width))
         layout["bars"].update(_bars(positions, width))
+        layout["orders"].update(_orders_table(width))
         layout["open"].update(_positions_table(positions, closed=False, width=width))
         layout["closed"].update(_positions_table(positions, closed=True,  width=width))
+        layout["activity"].update(_activity_report(positions))
         layout["scorecard"].update(_scorecard(positions))
         return layout
 
@@ -478,7 +597,9 @@ def _build(positions: list[dict], width: int, height: int) -> Layout:
         Layout(name="header",    size=3),
         Layout(name="metrics",   size=metrics_h),
         Layout(name="bars",      size=bars_h),
+        Layout(name="orders",    size=11),
         Layout(name="tables",    ratio=1),
+        Layout(name="activity",  size=8),
         Layout(name="scorecard", size=7),
     )
     layout["tables"].split_row(
@@ -488,8 +609,10 @@ def _build(positions: list[dict], width: int, height: int) -> Layout:
     layout["header"].update(_header())
     layout["metrics"].update(_metrics(positions, width))
     layout["bars"].update(_bars(positions, width))
+    layout["orders"].update(_orders_table(width))
     layout["open"].update(_positions_table(positions, closed=False, width=width))
     layout["closed"].update(_positions_table(positions, closed=True,  width=width))
+    layout["activity"].update(_activity_report(positions))
     layout["scorecard"].update(_scorecard(positions))
     return layout
 
@@ -558,10 +681,12 @@ def main() -> None:
         os.chdir(args.dir)
 
     # Show exactly which files are being watched
-    print(f"  Registry : {REGISTRY_FILE.resolve()}  "
-          f"({'found' if REGISTRY_FILE.is_file() else 'NOT FOUND'})")
-    print(f"  State    : {STATE_FILE.resolve()}  "
-          f"({'found' if STATE_FILE.is_file() else 'NOT FOUND — is main.py running?'})")
+        print(f"  Registry : {REGISTRY_FILE.resolve()}  "
+            f"({'found' if REGISTRY_FILE.is_file() else 'NOT FOUND'})")
+        print(f"  Orders   : {ORDER_FILE.resolve()}  "
+            f"({'found' if ORDER_FILE.is_file() else 'NOT FOUND'})")
+        print(f"  State    : {STATE_FILE.resolve()}  "
+            f"({'found' if STATE_FILE.is_file() else 'NOT FOUND — is main.py running?'})")
     print()
 
     live_mode = args.live or not args.snapshot

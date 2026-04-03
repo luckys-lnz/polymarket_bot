@@ -17,6 +17,11 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
 )
+
+# Suppress httpx logs to prevent token exposure in URL logging
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext").setLevel(logging.WARNING)
+
 log = logging.getLogger("main")
 
 _DESCRIPTION = """

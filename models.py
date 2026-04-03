@@ -1,7 +1,7 @@
 """models.py — Shared data models used across the bot."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -50,6 +50,8 @@ class TradeSignal:
     size_fraction:    float
     neg_risk:         bool
     days_to_expiry:   float = 0.0
+    market_type:      str = "price_target"  # price_target, between, up_down, less_than, multi_outcome
+    related_markets:  list[str] = field(default_factory=list)  # For multi-outcome: related market questions
 
 
 @dataclass
@@ -69,6 +71,9 @@ class RegistryPosition:
     end_date:            str
     asset:               str
     condition_id:        Optional[str] = None
+    initial_size_usdc:   float = 0.0
+    partial_tp_done:     bool = False
+    partial_tp_realised_pnl: float = 0.0
 
     exit_price:    Optional[float] = None
     exit_time:     Optional[float] = None
@@ -81,15 +86,17 @@ class RegistryPosition:
 
     @property
     def realised_pnl(self) -> float:
+        base = self.partial_tp_realised_pnl
         if self.exit_price is None:
-            return 0.0
-        return (self.exit_price - self.entry_price) * self.size_tokens
+            return base
+        return base + ((self.exit_price - self.entry_price) * self.size_tokens)
 
     @property
     def return_pct(self) -> float:
-        if self.size_usdc == 0 or self.exit_price is None:
+        denom = self.initial_size_usdc if self.initial_size_usdc > 0 else self.size_usdc
+        if denom == 0 or self.exit_price is None:
             return 0.0
-        return (self.realised_pnl / self.size_usdc) * 100
+        return (self.realised_pnl / denom) * 100
 
 @dataclass
 class PriceAlert:

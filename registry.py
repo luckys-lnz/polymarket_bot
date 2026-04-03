@@ -75,6 +75,7 @@ class PositionRegistry:
                 entry_price         = fill_price,
                 size_tokens         = fill_tokens,
                 size_usdc           = round(fill_tokens * fill_price, 4),
+                initial_size_usdc   = round(fill_tokens * fill_price, 4),
                 fair_value_at_entry = fair_value_at_entry,
                 edge_at_entry       = edge_at_entry,
                 neg_risk            = neg_risk,
@@ -99,6 +100,7 @@ class PositionRegistry:
             ) / total_tokens
         pos.size_tokens = total_tokens
         pos.size_usdc = round(pos.size_usdc + (fill_price * fill_tokens), 4)
+        pos.initial_size_usdc = round(pos.initial_size_usdc + (fill_price * fill_tokens), 4)
         self._persist()
         log.info("Registry: add_fill %-55s  +%.4f tokens @ %.4f  total=%.4f",
                  market_question[:55], fill_tokens, fill_price, pos.size_tokens)
@@ -118,6 +120,47 @@ class PositionRegistry:
         log.info("Registry: closed  %-55s  %s  P&L=$%+.2f  scorecard: %s",
                  market_question[:55], reason, pos.realised_pnl, self.stats.summary_line())
         return pos
+
+    def close_partial(
+        self,
+        market_question: str,
+        *,
+        exit_price: float,
+        close_tokens: float,
+        reason: str,
+    ) -> Optional[dict]:
+        """
+        Partially close an open position without finalizing trade stats.
+        Returns details of the partial close, or None if no update was applied.
+        """
+        pos = self._positions.get(market_question)
+        if pos is None or not pos.is_open or close_tokens <= 0:
+            return None
+
+        close_tokens = min(close_tokens, pos.size_tokens)
+        if close_tokens <= 0:
+            return None
+
+        closed_cost_basis = close_tokens * pos.entry_price
+        closed_notional = close_tokens * exit_price
+        partial_pnl = closed_notional - closed_cost_basis
+
+        pos.size_tokens = max(pos.size_tokens - close_tokens, 0.0)
+        pos.size_usdc = round(max(pos.size_usdc - closed_cost_basis, 0.0), 4)
+        pos.partial_tp_done = pos.partial_tp_done or reason == "partial_take_profit"
+        pos.partial_tp_realised_pnl = round(pos.partial_tp_realised_pnl + partial_pnl, 4)
+
+        self._persist()
+        log.info(
+            "Registry: partial %-55s  %s  tokens=%.4f exit=%.4f pnl=$%+.2f remain=%.4f",
+            market_question[:55], reason, close_tokens, exit_price, partial_pnl, pos.size_tokens,
+        )
+        return {
+            "position": pos,
+            "closed_tokens": close_tokens,
+            "closed_usdc": round(closed_notional, 4),
+            "pnl": round(partial_pnl, 4),
+        }
 
     def load(self) -> None:
         if not self._path.exists():
