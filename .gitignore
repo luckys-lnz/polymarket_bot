@@ -6,3 +6,8 @@ __pycache__/
 .bot_state
 paper_trades.json
 position_registry.json
+order_registry.json
+trade_analytics.jsonl
+trade_analytics_summary.json
+*.lock
+.vscode/
