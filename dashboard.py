@@ -12,6 +12,7 @@ from typing import Any
 
 import aiohttp
 import websockets
+from analytics import TradeAnalyticsJournal
 from rich import box
 from rich.columns import Columns
 from rich.console import Console, Group
@@ -25,6 +26,7 @@ from rich.text import Text
 REGISTRY_FILE = Path("position_registry.json")
 ORDER_FILE    = Path("order_registry.json")
 STATE_FILE    = Path(".bot_state")
+ANALYTICS_SUMMARY_FILE = Path("trade_analytics_summary.json")
 GAMMA_URL     = "https://gamma-api.polymarket.com/markets"
 
 # ── Refresh cadence (decoupled) ───────────────────────────────────────────────
@@ -82,6 +84,52 @@ def _load_orders() -> list[dict]:
         return json.loads(ORDER_FILE.read_text())
     except (json.JSONDecodeError, OSError):
         return []
+
+
+def _load_analytics_summary() -> dict[str, Any]:
+    if not ANALYTICS_SUMMARY_FILE.is_file():
+        return {}
+    try:
+        payload = json.loads(ANALYTICS_SUMMARY_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _phase0_metrics() -> dict[str, Any]:
+    summary = _load_analytics_summary()
+    totals = summary.get("totals") if isinstance(summary, dict) else {}
+    if not isinstance(totals, dict):
+        totals = {}
+
+    read_only_mode = bool(_state("read_only_mode", False))
+    stale_count = int(_state("stale_orderbook_count", 0) or 0)
+    reconcile_failures = int(_state("reconcile_failures_count", 0) or 0)
+    fetch_failures = int(_state("orderbook_fetch_failures_count", 0) or 0)
+    stale_rate = (stale_count / fetch_failures) if fetch_failures > 0 else 0.0
+
+    try:
+        mode = str(_state("mode", "paper")).lower()
+        fill_quality = TradeAnalyticsJournal(mode=mode).compute_fill_quality(window=50)
+    except Exception:
+        fill_quality = {
+            "fill_ratio": 0.0,
+            "cancel_to_fill": 0.0,
+            "passes_quality_gate": False,
+            "order_count": 0,
+        }
+
+    net_realised = float(totals.get("realised_pnl", _state("realised_pnl", 0.0)) or 0.0)
+
+    return {
+        "read_only_mode": read_only_mode,
+        "stale_count": stale_count,
+        "reconcile_failures": reconcile_failures,
+        "fetch_failures": fetch_failures,
+        "stale_rate": stale_rate,
+        "fill_quality": fill_quality,
+        "net_realised": net_realised,
+    }
 
 
 # ── P&L helpers ───────────────────────────────────────────────────────────────
@@ -207,22 +255,13 @@ def _header() -> Panel:
     return Panel(g, style=f"on {_BG}", border_style=_BORDER, height=3, padding=(0, 2))
 
 
-# ── UI: Metric cards ──────────────────────────────────────────────────────────
-def _card(label: str, value: str, sub: str = "", val_style: str = _WHITE) -> Panel:
-    return Panel(
-        Text.assemble(
-            Text(label + "\n", style=f"{_MUTED} bold"),
-            Text(value + "\n", style=val_style),
-            Text(sub,          style=_DIM),
-        ),
-        style=f"on {_BG2}", border_style=_BORDER, padding=(0, 1), height=6,
-    )
-
-def _metrics(positions: list[dict], width: int) -> Group | Columns:
+# ── UI: Metric list/table ────────────────────────────────────────────────────
+def _metrics(positions: list[dict], width: int) -> Panel:
     orders   = _load_orders()
     open_p   = [p for p in positions if not p.get("exit_price")]
     closed_p = [p for p in positions if p.get("exit_price")]
     pending_orders = [o for o in orders if o.get("status") in ("pending", "open", "partial")]
+    phase0 = _phase0_metrics()
 
     # Bankroll comes exclusively from .bot_state written by main.py
     # No static fallback — if the bot isn't running we show — not a fake number
@@ -247,43 +286,78 @@ def _metrics(positions: list[dict], width: int) -> Group | Columns:
     deployed_sub  = f"{_pct_of(deployed, bankroll)} used"
     u_pnl_sub     = f"{_pct_of(u_pnl, bankroll)} of bankroll"
 
-    cards = [
-        _card("BANKROLL",       bankroll_str,   "USDC" if bankroll else "bot not running"),
-        _card("DEPLOYED",       f"${deployed:,.2f}",   deployed_sub, _YELLOW),
-        _card("UNREALISED P&L", f"{'+'if u_pnl>=0 else''}${u_pnl:.2f}",
-              u_pnl_sub, _pnl_style(u_pnl)),
-        _card("REALISED P&L",   f"{'+'if r_pnl>=0 else''}${r_pnl:.2f}",
-              f"{len(closed_p)} closed", _pnl_style(r_pnl)),
-        _card("WIN RATE",
-              f"{win_rate*100:.0f}%" if win_rate is not None else "—",
-              f"{wins}W / {len(closed_p)-wins}L" if closed_p else "no closed trades",
-              _GREEN if (win_rate or 0) >= 0.55 else (_YELLOW if (win_rate or 0) >= 0.45 else _RED)),
-          _card("ORDERS",         str(len(pending_orders)),
-              f"pending/open/partial", _YELLOW if pending_orders else _DIM),
-          _card("AVG EDGE",       f"+{avg_edge*100:.1f}pp",
-              f"{len(open_p)} open positions", _edge_style(avg_edge)),
+    t = Table(
+        box=box.SIMPLE_HEAD,
+        show_edge=False,
+        expand=True,
+        header_style=f"bold {_DIM}",
+        style=f"on {_BG2}",
+        row_styles=[f"on {_BG2}", f"on {_BG}"],
+    )
+    t.add_column("Metric", width=18)
+    t.add_column("Value", width=16, justify="right")
+    t.add_column("Detail", ratio=1)
+    t.add_column("Status", width=10, justify="center")
+
+    win_style = _GREEN if (win_rate or 0) >= 0.55 else (_YELLOW if (win_rate or 0) >= 0.45 else _RED)
+    stale_style = _RED if phase0["stale_rate"] > 0.80 else (_YELLOW if phase0["stale_rate"] > 0.30 else _GREEN)
+    quality_pass = bool(phase0["fill_quality"].get("passes_quality_gate"))
+
+    rows: list[tuple[str, str, str, str]] = [
+        ("Bankroll", bankroll_str, "USDC base", "OK"),
+        ("Deployed", f"${deployed:,.2f}", deployed_sub, "OK"),
+        ("Unrealised P&L", f"{'+' if u_pnl >= 0 else ''}${u_pnl:.2f}", u_pnl_sub, "OK" if u_pnl >= 0 else "WARN"),
+        ("Realised P&L", f"{'+' if r_pnl >= 0 else ''}${r_pnl:.2f}", f"{len(closed_p)} closed", "OK" if r_pnl >= 0 else "WARN"),
+        ("Net P&L", f"{'+' if phase0['net_realised'] >= 0 else ''}${phase0['net_realised']:.2f}", "fees adjusted", "OK" if phase0["net_realised"] >= 0 else "WARN"),
+        ("Win Rate", f"{win_rate * 100:.0f}%" if win_rate is not None else "—", f"{wins}W / {len(closed_p)-wins}L" if closed_p else "no closed trades", "OK" if (win_rate or 0) >= 0.50 else "HOLD"),
+        ("Orders", str(len(pending_orders)), "pending/open/partial", "OK" if len(pending_orders) > 0 else "IDLE"),
+        ("Avg Edge", f"+{avg_edge * 100:.1f}pp", f"{len(open_p)} open positions", "OK" if avg_edge >= 0.05 else "LOW"),
+        ("Infra Mode", "READ-ONLY" if phase0["read_only_mode"] else "ACTIVE", f"reconcile fail: {phase0['reconcile_failures']}", "ALERT" if phase0["read_only_mode"] else "OK"),
+        ("Stale Book Rate", f"{phase0['stale_rate'] * 100:.1f}%", f"{phase0['stale_count']}/{phase0['fetch_failures']} stale/fetch", "ALERT" if phase0["stale_rate"] > 0.80 else ("WARN" if phase0["stale_rate"] > 0.30 else "OK")),
+        (
+            "Fill Quality",
+            f"{float(phase0['fill_quality'].get('fill_ratio', 0.0)) * 100:.1f}%",
+            f"C:F {float(phase0['fill_quality'].get('cancel_to_fill', 0.0)):.2f}",
+            "PASS" if quality_pass else "HOLD",
+        ),
     ]
 
-    if width < 100:
-        per_row = 2
-    elif width < 150:
-        per_row = 3
-    else:
-        per_row = 6
+    for metric, value, detail, status in rows:
+        value_style = _WHITE
+        if metric in ("Unrealised P&L", "Realised P&L", "Net P&L"):
+            if metric == "Unrealised P&L":
+                value_style = _pnl_style(u_pnl)
+            elif metric == "Realised P&L":
+                value_style = _pnl_style(r_pnl)
+            else:
+                value_style = _pnl_style(phase0["net_realised"])
+        elif metric == "Win Rate":
+            value_style = win_style
+        elif metric == "Avg Edge":
+            value_style = _edge_style(avg_edge)
+        elif metric == "Infra Mode":
+            value_style = _RED if phase0["read_only_mode"] else _GREEN
+        elif metric == "Stale Book Rate":
+            value_style = stale_style
+        elif metric == "Fill Quality":
+            value_style = _GREEN if quality_pass else _YELLOW
 
-    rows = [Columns(cards[i:i+per_row], equal=True, expand=True)
-            for i in range(0, len(cards), per_row)]
-    return rows[0] if len(rows) == 1 else Group(*rows)
+        status_style = _GREEN if status in ("OK", "PASS") else (_YELLOW if status in ("WARN", "HOLD", "LOW") else _RED)
+        t.add_row(
+            Text(metric, style=_MUTED),
+            Text(value, style=value_style),
+            Text(detail, style=_DIM),
+            Text(status, style=status_style),
+        )
 
-
-def _metric_rows(width: int) -> int:
-    if width < 100:
-        per_row = 2
-    elif width < 150:
-        per_row = 3
-    else:
-        per_row = 6
-    return (7 + per_row - 1) // per_row
+    return Panel(
+        t,
+        title=Text("RUNTIME METRICS", style=f"bold {_DIM}"),
+        title_align="left",
+        style=f"on {_BG}",
+        border_style=_BORDER,
+        padding=(0, 0),
+    )
 
 
 def _orders_table(width: int) -> Panel:
@@ -567,8 +641,7 @@ def _build(positions: list[dict], width: int, height: int) -> Layout:
         pass
     layout = Layout()
 
-    metrics_rows = _metric_rows(width)
-    metrics_h    = max(6, metrics_rows * 6 + (metrics_rows - 1))
+    metrics_h    = 15 if width >= 110 else 18
     bars_h       = max(4, len([p for p in positions if not p.get("exit_price")]) * 2 + 4)
     bars_h       = min(bars_h, max(4, height // 3))
 
