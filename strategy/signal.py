@@ -104,6 +104,11 @@ class CryptoStrategy:
     def min_edge(self) -> float:
         return self._min_edge
 
+    def set_min_edge(self, value: float) -> None:
+        # Keep runtime tuning within sane bounds to avoid disabling trading
+        # or overfitting to short-term noise.
+        self._min_edge = max(0.01, min(float(value), 0.20))
+
     def _vol_regime_adjusted_edge(self, asset: str, sigma: float) -> float:
         """
         Adjust minimum edge threshold based on realized vol regime.
