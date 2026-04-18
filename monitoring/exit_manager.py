@@ -57,6 +57,29 @@ class AutoExitManager:
         self._time_stop_fair_threshold = max(0.0, min(time_stop_fair_value_threshold, 1.0))
         self._exiting:       set[str] = set()
 
+    def update_policy(
+        self,
+        *,
+        stop_loss_pct: Optional[float] = None,
+        take_profit_edge: Optional[float] = None,
+        partial_tp_trigger_pct: Optional[float] = None,
+        partial_tp_fraction: Optional[float] = None,
+        time_stop_expiry_progress: Optional[float] = None,
+        time_stop_fair_value_threshold: Optional[float] = None,
+    ) -> None:
+        if stop_loss_pct is not None:
+            self._stop_loss = max(0.05, min(float(stop_loss_pct), 0.80))
+        if take_profit_edge is not None:
+            self._take_profit = max(0.005, min(float(take_profit_edge), 0.20))
+        if partial_tp_trigger_pct is not None:
+            self._partial_tp_trigger = max(0.05, min(float(partial_tp_trigger_pct), 0.95))
+        if partial_tp_fraction is not None:
+            self._partial_tp_fraction = max(0.05, min(float(partial_tp_fraction), 0.95))
+        if time_stop_expiry_progress is not None:
+            self._time_stop_progress = max(0.0, min(float(time_stop_expiry_progress), 1.0))
+        if time_stop_fair_value_threshold is not None:
+            self._time_stop_fair_threshold = max(0.0, min(float(time_stop_fair_value_threshold), 1.0))
+
     async def evaluate_all(self, asset: str) -> None:
         spot = self._spot.price(asset)
         if spot is None:
