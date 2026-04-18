@@ -191,6 +191,61 @@ python3 dashboard.py --live --bankroll 200
 
 The dashboard default bankroll is `500`, while the paper trader default bankroll is `200`. Pass the same bankroll to both if you want the summary numbers to line up.
 
+### Web Dashboard (HTMX + Tailwind)
+
+Run the lightweight operator dashboard locally:
+
+```bash
+uvicorn web_dashboard:app --host 127.0.0.1 --port 8080 --reload
+```
+
+Optional token guard for local/LAN use:
+
+```bash
+export DASHBOARD_TOKEN=your_secret_token
+uvicorn web_dashboard:app --host 127.0.0.1 --port 8080 --reload
+```
+
+When token guard is enabled, open with:
+
+```text
+http://127.0.0.1:8080/?token=your_secret_token
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8080
+```
+
+The web dashboard reads bot state from `.bot_state`, `position_registry.json`,
+`order_registry.json`, and `trade_analytics_summary.json` and auto-refreshes each panel.
+
+### Profit-Only 8-Day Soak Config
+
+For an 8-day autonomous test where the bot focuses only on money-making behavior,
+set the following env values before launch:
+
+```bash
+export AUTO_TUNE=1
+export AUTO_TUNE_INTERVAL_SECS=600
+export AUTO_TUNE_GLOBAL_COOLDOWN_SECS=3600
+export AUTO_TUNE_ASSET_COOLDOWN_SECS=21600
+export AUTO_TUNE_MIN_CLOSED_GLOBAL=8
+export AUTO_TUNE_MIN_CLOSED_ASSET=6
+export AUTO_TUNE_WINRATE_DEADBAND=0.08
+export AUTO_TUNE_ASSET_MIN_ABS_PNL=1.0
+```
+
+Recommended run command for soak:
+
+```bash
+python3 main.py --paper --scan-interval 60
+```
+
+This configuration keeps auto-tune active, but prevents frequent parameter flips
+unless there is enough trade sample and directional performance signal.
+
 ### Read-only live bot demo
 
 This runs the live market scanner and prints signals, but does not place orders:
