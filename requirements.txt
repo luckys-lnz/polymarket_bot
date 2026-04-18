@@ -9,3 +9,6 @@ eth-account>=0.10.0        # Wallet signing
 python-dotenv>=1.0.0       # Load .env config
 python-telegram-bot>=20.0  # Signal notifications + approval buttons
 rich>=13.0.0               # Terminal dashboard UI
+fastapi>=0.115.0           # Web dashboard backend
+uvicorn>=0.30.0            # ASGI server for dashboard
+jinja2>=3.1.0              # HTML templates for dashboard
