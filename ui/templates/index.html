@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{{ title }}</title>
+    <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+      window.dashboardDetailPinned = false;
+      function toggleDetailPin(el) {
+        window.dashboardDetailPinned = !!el.checked;
+      }
+      window.dashboardUiBusyUntil = 0;
+      window.dashboardUiHold = function (ms) {
+        var holdMs = Number(ms || 2500);
+        window.dashboardUiBusyUntil = Math.max(
+          window.dashboardUiBusyUntil,
+          Date.now() + holdMs,
+        );
+      };
+      window.dashboardUiBusy = function () {
+        return Date.now() < window.dashboardUiBusyUntil;
+      };
+      document.addEventListener(
+        "focusin",
+        function () {
+          window.dashboardUiHold(4000);
+        },
+        true,
+      );
+      document.addEventListener(
+        "pointerdown",
+        function () {
+          window.dashboardUiHold(2500);
+        },
+        true,
+      );
+      document.addEventListener(
+        "change",
+        function () {
+          window.dashboardUiHold(2500);
+        },
+        true,
+      );
+    </script>
+    <style>
+      body {
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      }
+      .mono {
+        font-family: "IBM Plex Mono", "JetBrains Mono", monospace;
+      }
+    </style>
+  </head>
+  <body class="bg-slate-950 text-slate-100">
+    <div
+      class="min-h-screen bg-[radial-gradient(circle_at_20%_20%,rgba(20,184,166,0.18),transparent_35%),radial-gradient(circle_at_80%_0%,rgba(251,191,36,0.12),transparent_30%),linear-gradient(to_bottom,#020617,#0f172a)]"
+    >
+      <header
+        class="border-b border-slate-800/80 backdrop-blur supports-[backdrop-filter]:bg-slate-950/50"
+      >
+        <div class="mx-auto max-w-[1700px] px-4 py-4 md:px-6">
+          <h1 class="text-xl font-semibold tracking-tight md:text-2xl">
+            Polymarket Bot Operator Dashboard
+          </h1>
+          <p class="mt-1 text-sm text-slate-400">
+            Live state for paper/live sessions with full-width trade visibility.
+          </p>
+        </div>
+      </header>
+
+      <main
+        class="mx-auto grid max-w-[1700px] gap-4 px-4 py-4 md:grid-cols-12 md:gap-5 md:px-6"
+      >
+        <section class="md:col-span-12">
+          <div
+            id="overview-panel"
+            hx-get="/fragments/overview{{ token_suffix }}"
+            hx-trigger="every 2s"
+            hx-swap="innerHTML"
+          >
+            {% include 'fragments/overview.html' %}
+          </div>
+        </section>
+
+        <section class="md:col-span-8">
+          <div
+            class="rounded-xl border border-slate-800/90 bg-slate-900/60 p-3 md:p-4"
+          >
+            <h2 class="mb-3 text-base font-semibold">Positions</h2>
+            <div
+              id="positions-panel"
+              hx-get="/fragments/positions{{ token_suffix }}"
+              hx-trigger="every 3s [!window.dashboardUiBusy()]"
+              hx-include="#positions-panel form"
+              hx-swap="innerHTML"
+            >
+              {% include 'fragments/positions.html' %}
+            </div>
+          </div>
+        </section>
+
+        <section class="md:col-span-4">
+          <div
+            class="rounded-xl border border-slate-800/90 bg-slate-900/60 p-3 md:p-4"
+          >
+            <h2 class="mb-3 text-base font-semibold">Analytics</h2>
+            <div
+              id="analytics-panel"
+              hx-get="/fragments/analytics{{ token_suffix }}"
+              hx-trigger="every 8s"
+              hx-swap="innerHTML"
+            >
+              {% include 'fragments/analytics.html' %}
+            </div>
+          </div>
+        </section>
+
+        <section class="md:col-span-12">
+          <div
+            class="rounded-xl border border-slate-800/90 bg-slate-900/60 p-3 md:p-4"
+          >
+            <h2 class="mb-3 text-base font-semibold">Orders</h2>
+            <div
+              id="orders-panel"
+              hx-get="/fragments/orders{{ token_suffix }}"
+              hx-trigger="every 2s [!window.dashboardUiBusy()]"
+              hx-include="#orders-panel form"
+              hx-swap="innerHTML"
+            >
+              {% include 'fragments/orders.html' %}
+            </div>
+          </div>
+        </section>
+
+        <section class="md:col-span-12">
+          <div
+            id="detail-panel"
+            hx-get="/fragments/detail{{ token_suffix }}"
+            hx-trigger="load"
+            hx-swap="innerHTML"
+          >
+            {% include 'fragments/detail.html' %}
+          </div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

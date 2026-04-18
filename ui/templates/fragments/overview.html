@@ -1,0 +1,75 @@
+<div class="grid gap-3 grid-cols-2 md:grid-cols-4 xl:grid-cols-8">
+  <div class="rounded-lg border border-slate-800 bg-slate-900/80 p-3">
+    <p class="text-xs uppercase tracking-wide text-slate-400">Mode</p>
+    <p class="mt-1 text-lg font-semibold {{ 'text-emerald-300' if mode == 'PAPER' else 'text-rose-300' }}">
+      {{ mode }}{% if read_only_mode %}&nbsp;<span class="text-xs font-normal text-amber-400">R/O</span>{% endif %}
+    </p>
+  </div>
+  <div class="rounded-lg border border-slate-800 bg-slate-900/80 p-3">
+    <p class="text-xs uppercase tracking-wide text-slate-400">Bankroll</p>
+    <p class="mono mt-1 text-lg font-semibold">${{ '%.2f'|format(bankroll) }}</p>
+  </div>
+  <div class="rounded-lg border border-slate-800 bg-slate-900/80 p-3">
+    <p class="text-xs uppercase tracking-wide text-slate-400">Deployed</p>
+    <p class="mono mt-1 text-lg font-semibold text-amber-300">${{ '%.2f'|format(deployed) }}</p>
+  </div>
+  <div class="rounded-lg border border-slate-800 bg-slate-900/80 p-3">
+    <p class="text-xs uppercase tracking-wide text-slate-400">Available</p>
+    <p class="mono mt-1 text-lg font-semibold text-cyan-300">${{ '%.2f'|format(available) }}</p>
+  </div>
+  <div class="rounded-lg border border-slate-800 bg-slate-900/80 p-3">
+    <p class="text-xs uppercase tracking-wide text-slate-400">Net P&amp;L</p>
+    <p class="mono mt-1 text-lg font-semibold {{ 'text-emerald-300' if net_realised_pnl >= 0 else 'text-rose-300' }}">
+      {{ '+' if net_realised_pnl >= 0 else '' }}${{ '%.2f'|format(net_realised_pnl) }}
+    </p>
+  </div>
+  <div class="rounded-lg border border-slate-800 bg-slate-900/80 p-3">
+    <p class="text-xs uppercase tracking-wide text-slate-400">Win Rate</p>
+    <p class="mono mt-1 text-lg font-semibold">
+      {% if win_rate is not none %}{{ '%.1f'|format(win_rate * 100) }}%{% else %}-{% endif %}
+    </p>
+  </div>
+  <div class="rounded-lg border border-slate-800 bg-slate-900/80 p-3">
+    <p class="text-xs uppercase tracking-wide text-slate-400">Open / Closed</p>
+    <p class="mono mt-1 text-lg font-semibold">{{ open_count }} / {{ closed_count }}</p>
+  </div>
+  <div class="rounded-lg border border-slate-800 bg-slate-900/80 p-3">
+    <p class="text-xs uppercase tracking-wide text-slate-400">Active Orders</p>
+    <p class="mono mt-1 text-lg font-semibold">{{ active_orders }}</p>
+  </div>
+</div>
+<div
+  class="mt-3 flex flex-wrap gap-3 rounded-lg border border-slate-800 bg-slate-950/60 p-3 text-xs text-slate-400"
+>
+  <span>State: <span class="text-slate-200">{{ freshness.state }}</span></span>
+  <span
+    >Positions:
+    <span class="text-slate-200">{{ freshness.positions }}</span></span
+  >
+  <span
+    >Orders: <span class="text-slate-200">{{ freshness.orders }}</span></span
+  >
+  <span
+    >Analytics:
+    <span class="text-slate-200">{{ freshness.analytics }}</span></span
+  >
+  <span
+    >Infra (stale/fetch):
+    <span class="text-slate-200"
+      >{{ stale_orderbook_count }}/{{ orderbook_fetch_failures_count }}</span
+    ></span
+  >
+  <span
+    >Reconcile failures:
+    <span class="text-slate-200">{{ reconcile_failures_count }}</span></span
+  >
+  <span
+    >Quality gate:
+    <span class="text-slate-200"
+      >{{ 'PASS' if fill_quality.passes_quality_gate else 'HOLD' }}</span
+    ></span
+  >
+  <span class="ml-auto"
+    >Updated: <span class="text-slate-200">{{ now }}</span></span
+  >
+</div>

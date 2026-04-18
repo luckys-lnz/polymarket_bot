@@ -1,0 +1,174 @@
+<div class="space-y-4">
+  <form
+    class="grid gap-2 rounded-lg border border-slate-800 bg-slate-950/60 p-3 md:grid-cols-3"
+    hx-get="/fragments/orders{{ token_suffix }}"
+    hx-target="#orders-panel"
+    hx-swap="innerHTML"
+    hx-trigger="load, keyup changed delay:350ms"
+  >
+    <input
+      type="text"
+      name="q"
+      value="{{ orders_q }}"
+      placeholder="Search market text"
+      class="w-full rounded border border-slate-700 bg-slate-900 px-2 py-2 text-sm text-slate-100 outline-none ring-cyan-400 focus:ring"
+    />
+    <select
+      name="status"
+      class="w-full rounded border border-slate-700 bg-slate-900 px-2 py-2 text-sm text-slate-100 outline-none ring-cyan-400 focus:ring"
+    >
+      <option value="all" {{ 'selected' if orders_status == 'all' else '' }}>All statuses</option>
+      <option value="active" {{ 'selected' if orders_status == 'active' else '' }}>Active only</option>
+      <option value="filled" {{ 'selected' if orders_status == 'filled' else '' }}>Filled</option>
+      <option value="expired" {{ 'selected' if orders_status == 'expired' else '' }}>Expired</option>
+      <option value="canceled" {{ 'selected' if orders_status == 'canceled' else '' }}>Canceled</option>
+      <option value="rejected" {{ 'selected' if orders_status == 'rejected' else '' }}>Rejected</option>
+    </select>
+    <select
+      name="sort"
+      class="w-full rounded border border-slate-700 bg-slate-900 px-2 py-2 text-sm text-slate-100 outline-none ring-cyan-400 focus:ring"
+    >
+      <option value="updated_desc" {{ 'selected' if orders_sort == 'updated_desc' else '' }}>Newest first</option>
+      <option value="updated_asc" {{ 'selected' if orders_sort == 'updated_asc' else '' }}>Oldest first</option>
+      <option value="fill_desc" {{ 'selected' if orders_sort == 'fill_desc' else '' }}>Highest fill progress</option>
+      <option value="size_desc" {{ 'selected' if orders_sort == 'size_desc' else '' }}>Largest order size</option>
+    </select>
+  </form>
+
+  <div>
+    <h3 class="mb-2 text-sm font-semibold text-cyan-300">
+      Active Orders ({{ active_rows|length }})
+    </h3>
+    <div class="overflow-x-auto rounded-lg border border-slate-800">
+      <table class="min-w-full text-sm">
+        <thead
+          class="sticky top-0 bg-slate-950/95 text-xs uppercase tracking-wide text-slate-400"
+        >
+          <tr>
+            <th class="px-3 py-2 text-left">Market</th>
+            <th class="px-3 py-2 text-left">Status</th>
+            <th class="px-3 py-2 text-right">Limit</th>
+            <th class="hidden px-3 py-2 text-right md:table-cell">Filled</th>
+            <th class="px-3 py-2 text-right">Progress</th>
+            <th class="hidden px-3 py-2 text-left lg:table-cell">Updated</th>
+            <th class="hidden px-3 py-2 text-left lg:table-cell">Order ID</th>
+            <th class="px-3 py-2 text-left">Detail</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in active_rows %}
+          <tr class="border-t border-slate-800/80 hover:bg-slate-800/25">
+            <td class="max-w-[560px] px-3 py-2 align-top text-slate-100">
+              <details>
+                <summary class="cursor-pointer">{{ row.market_question[:100] }}{% if row.market_question|length > 100 %}...{% endif %}</summary>
+                <p class="mt-2 whitespace-normal text-xs text-slate-300">{{ row.market_question }}</p>
+              </details>
+            </td>
+            <td class="px-3 py-2 align-top text-amber-300">{{ row.status }}</td>
+            <td class="mono px-3 py-2 text-right align-top">
+              {{ '%.4f'|format(row.limit_price or 0) }}
+            </td>
+            <td class="mono hidden px-3 py-2 text-right align-top md:table-cell">
+              {{ '%.2f'|format(row.filled_tokens or 0) }}/{{
+              '%.2f'|format(row.size_tokens or 0) }}
+            </td>
+            <td class="mono px-3 py-2 text-right align-top">
+              {{ '%.1f'|format(row.fill_pct or 0) }}%
+            </td>
+            <td class="hidden px-3 py-2 align-top text-slate-400 lg:table-cell">
+              {{ row.updated_at }}
+            </td>
+            <td
+              class="mono hidden max-w-[240px] truncate px-3 py-2 align-top text-slate-300 lg:table-cell"
+            >
+              {{ row.order_id }}
+            </td>
+            <td class="px-3 py-2 align-top">
+              <button
+                type="button"
+                class="rounded border border-cyan-700/70 px-2 py-1 text-xs text-cyan-200 hover:bg-cyan-900/30"
+                onclick="window.dashboardUiHold(3000); return !window.dashboardDetailPinned;"
+                hx-get="/fragments/detail{{ token_suffix }}"
+                hx-vals='{{ {"kind": "order", "order_id": row.order_id, "market_question": row.market_question}|tojson }}'
+                hx-target="#detail-panel"
+                hx-swap="innerHTML"
+              >Inspect</button>
+            </td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="8" class="px-3 py-3 text-center text-slate-500">
+              No active orders.
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div>
+    <h3 class="mb-2 text-sm font-semibold text-slate-300">
+      Recent Order History ({{ history_rows|length }})
+    </h3>
+    <div class="overflow-x-auto rounded-lg border border-slate-800">
+      <table class="min-w-full text-sm">
+        <thead
+          class="sticky top-0 bg-slate-950/95 text-xs uppercase tracking-wide text-slate-400"
+        >
+          <tr>
+            <th class="px-3 py-2 text-left">Market</th>
+            <th class="px-3 py-2 text-left">Status</th>
+            <th class="px-3 py-2 text-right">Limit</th>
+            <th class="px-3 py-2 text-right">Tokens</th>
+            <th class="hidden px-3 py-2 text-left lg:table-cell">Updated</th>
+            <th class="px-3 py-2 text-left">Detail</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in history_rows %}
+          <tr class="border-t border-slate-800/80 hover:bg-slate-800/25">
+            <td class="max-w-[600px] px-3 py-2 align-top text-slate-100">
+              <details>
+                <summary class="cursor-pointer">{{ row.market_question[:100] }}{% if row.market_question|length > 100 %}...{% endif %}</summary>
+                <p class="mt-2 whitespace-normal text-xs text-slate-300">{{ row.market_question }}</p>
+              </details>
+            </td>
+            <td
+              class="px-3 py-2 align-top {{ 'text-emerald-300' if row.status == 'filled' else 'text-slate-300' }}"
+            >
+              {{ row.status }}
+            </td>
+            <td class="mono px-3 py-2 text-right align-top">
+              {{ '%.4f'|format(row.limit_price or 0) }}
+            </td>
+            <td class="mono px-3 py-2 text-right align-top">
+              {{ '%.2f'|format(row.size_tokens or 0) }}
+            </td>
+            <td class="hidden px-3 py-2 align-top text-slate-400 lg:table-cell">
+              {{ row.updated_at }}
+            </td>
+            <td class="px-3 py-2 align-top">
+              <button
+                type="button"
+                class="rounded border border-cyan-700/70 px-2 py-1 text-xs text-cyan-200 hover:bg-cyan-900/30"
+                onclick="window.dashboardUiHold(3000); return !window.dashboardDetailPinned;"
+                hx-get="/fragments/detail{{ token_suffix }}"
+                hx-vals='{{ {"kind": "order", "order_id": row.order_id, "market_question": row.market_question}|tojson }}'
+                hx-target="#detail-panel"
+                hx-swap="innerHTML"
+              >Inspect</button>
+            </td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="6" class="px-3 py-3 text-center text-slate-500">
+              No historical orders yet.
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>

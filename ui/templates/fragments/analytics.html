@@ -1,0 +1,105 @@
+<div class="space-y-4 text-sm">
+  <div class="grid gap-2 grid-cols-2">
+    <div class="rounded-lg border border-slate-800 bg-slate-950/70 p-3">
+      <p class="text-xs uppercase tracking-wide text-slate-400">Today Closed</p>
+      <p class="mono mt-1 text-lg font-semibold">{{ today.closed_trades or 0 }}</p>
+    </div>
+    <div class="rounded-lg border border-slate-800 bg-slate-950/70 p-3">
+      <p class="text-xs uppercase tracking-wide text-slate-400">Today P&amp;L</p>
+      <p class="mono mt-1 text-lg font-semibold {{ 'text-emerald-300' if (today.realised_pnl or 0) >= 0 else 'text-rose-300' }}">
+        {{ '+' if (today.realised_pnl or 0) >= 0 else '' }}${{ '%.2f'|format(today.realised_pnl or 0) }}
+      </p>
+    </div>
+  </div>
+
+  <div class="rounded-lg border border-slate-800 bg-slate-950/70 p-3">
+    <p class="mb-2 text-xs uppercase tracking-wide text-slate-400">Order Health</p>
+    <div class="grid gap-x-4 gap-y-1 grid-cols-3 text-xs">
+      <div>
+        <span class="text-slate-400">Stale Book</span>
+        <p class="mono font-semibold {{ 'text-rose-300' if stale_orderbook_rate > 0.8 else 'text-amber-300' if stale_orderbook_rate > 0.3 else 'text-emerald-300' }}">
+          {{ '%.1f'|format(stale_orderbook_rate * 100) }}%
+        </p>
+      </div>
+      <div>
+        <span class="text-slate-400">Fill Ratio</span>
+        <p class="mono font-semibold {{ 'text-emerald-300' if fill_quality.passes_quality_gate else 'text-amber-300' }}">
+          {{ '%.1f'|format((fill_quality.fill_ratio or 0) * 100) }}%
+        </p>
+      </div>
+      <div>
+        <span class="text-slate-400">Cancel:Fill</span>
+        <p class="mono font-semibold {{ 'text-rose-300' if (fill_quality.cancel_to_fill or 0) > 2.0 else 'text-emerald-300' }}">
+          {{ '%.2f'|format(fill_quality.cancel_to_fill or 0) }}
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <div class="rounded-lg border border-slate-800 bg-slate-950/70 p-3">
+    <p class="mb-2 text-xs uppercase tracking-wide text-slate-400">
+      Top Failure Reasons
+    </p>
+    <ul class="space-y-1 text-slate-200">
+      {% for item in top_failure_reasons[:5] %}
+      <li class="flex justify-between gap-3">
+        <span class="truncate">{{ item.reason }}</span
+        ><span class="mono text-slate-400">{{ item.count }}</span>
+      </li>
+      {% else %}
+      <li class="text-slate-500">No failure reasons yet.</li>
+      {% endfor %}
+    </ul>
+  </div>
+
+  <div class="rounded-lg border border-slate-800 bg-slate-950/70 p-3">
+    <p class="mb-2 text-xs uppercase tracking-wide text-slate-400">
+      Action Plan (Specific)
+    </p>
+    <ul class="space-y-2">
+      {% for action in specific_actions[:4] %}
+      <li class="rounded-md border border-slate-800 px-2 py-2">
+        <p
+          class="font-medium {{ 'text-rose-300' if action.severity == 'high' else 'text-amber-300' if action.severity == 'medium' else 'text-slate-200' }}"
+        >
+          {{ action.title }}
+        </p>
+        <p class="mt-1 text-xs text-slate-400">{{ action.why }}</p>
+        {% if action.changes %}
+        <div class="mt-2 grid gap-1">
+          {% for ch in action.changes %}
+          <p class="mono text-xs text-cyan-200">
+            {{ ch.param }}: {{ ch.current }} -> {{ ch.suggested }}
+          </p>
+          {% endfor %}
+        </div>
+        {% endif %}
+      </li>
+      {% else %}
+      <li class="text-slate-500">No specific action items yet.</li>
+      {% endfor %}
+    </ul>
+  </div>
+
+  <div class="rounded-lg border border-slate-800 bg-slate-950/70 p-3">
+    <p class="mb-2 text-xs uppercase tracking-wide text-slate-400">
+      Diagnostics
+    </p>
+    <ul class="space-y-2">
+      {% for item in diagnostics[:5] %}
+      <li class="rounded-md border border-slate-800 px-2 py-2">
+        <p
+          class="font-medium {{ 'text-rose-300' if item.severity == 'high' else 'text-amber-300' if item.severity == 'medium' else 'text-slate-200' }}"
+        >
+          {{ item.issue }}
+        </p>
+        <p class="mt-1 text-xs text-slate-400">{{ item.suggested_tweak }}</p>
+      </li>
+      {% else %}
+      <li class="text-slate-500">No diagnostics emitted yet.</li>
+      {% endfor %}
+    </ul>
+  </div>
+
+  <p class="text-xs text-slate-500">Generated: {{ generated_at or 'n/a' }}</p>
+</div>

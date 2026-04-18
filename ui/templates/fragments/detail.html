@@ -1,0 +1,224 @@
+<div class="rounded-xl border border-slate-800/90 bg-slate-900/60 p-3 md:p-4">
+  <div class="mb-3 flex items-center justify-between">
+    <h2 class="text-base font-semibold">Trade Detail</h2>
+    <label class="flex items-center gap-2 text-xs text-slate-400 cursor-pointer select-none">
+      <input type="checkbox" onchange="toggleDetailPin(this)" class="accent-cyan-400" />
+      Pin (lock panel)
+    </label>
+  </div>
+
+  {% if not position and not order %}
+  <div
+    class="rounded-lg border border-slate-800 bg-slate-950/60 p-4 text-sm text-slate-400"
+  >
+    Select Inspect on a row in Positions or Orders to view full trade context
+    and lifecycle events.
+  </div>
+  {% else %}
+  <div class="space-y-4 text-sm">
+    {% if position %} {% set pnl = (position.partial_tp_realised_pnl or 0) +
+    ((position.exit_price or 0) - (position.entry_price or 0)) *
+    (position.size_tokens or 0) if position.exit_price is not none else None %}
+    <div class="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+      <p class="mb-2 text-xs uppercase tracking-wide text-slate-400">
+        Position Snapshot
+      </p>
+      <p class="text-slate-100">{{ position.market_question }}</p>
+      <div class="mt-2 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+        <div>
+          <span class="text-slate-400">Asset:</span>
+          <span class="mono">{{ position.asset or '-' }}</span>
+        </div>
+        <div>
+          <span class="text-slate-400">Token ID:</span>
+          <span class="mono">{{ position.token_id or '-' }}</span>
+          {% if position.token_id %}
+          <button
+            class="ml-1 rounded border border-slate-700 px-1 py-0.5 text-[10px] text-slate-300 hover:bg-slate-800"
+            onclick="navigator.clipboard.writeText('{{ position.token_id }}')"
+          >
+            Copy
+          </button>
+          {% endif %}
+        </div>
+        <div>
+          <span class="text-slate-400">Condition ID:</span>
+          <span class="mono">{{ position.condition_id or '-' }}</span>
+          {% if position.condition_id %}
+          <button
+            class="ml-1 rounded border border-slate-700 px-1 py-0.5 text-[10px] text-slate-300 hover:bg-slate-800"
+            onclick="navigator.clipboard.writeText('{{ position.condition_id }}')"
+          >
+            Copy
+          </button>
+          {% endif %}
+        </div>
+        <div>
+          <span class="text-slate-400">Outcome:</span>
+          <span class="mono">{{ position.held_outcome or '-' }}</span>
+        </div>
+        <div>
+          <span class="text-slate-400">Entry:</span>
+          <span class="mono"
+            >{{ '%.4f'|format(position.entry_price or 0) }}</span
+          >
+        </div>
+        <div>
+          <span class="text-slate-400">Size:</span>
+          <span class="mono"
+            >${{ '%.2f'|format(position.size_usdc or 0) }}</span
+          >
+        </div>
+        <div>
+          <span class="text-slate-400">Tokens:</span>
+          <span class="mono"
+            >{{ '%.2f'|format(position.size_tokens or 0) }}</span
+          >
+        </div>
+        <div>
+          <span class="text-slate-400">Entry Edge:</span>
+          <span class="mono"
+            >{{ '%.2f'|format((position.edge_at_entry or 0) * 100) }}pp</span
+          >
+        </div>
+        <div>
+          <span class="text-slate-400">Exit Reason:</span>
+          <span class="mono">{{ position.exit_reason or '-' }}</span>
+        </div>
+        <div>
+          <span class="text-slate-400">P&L:</span>
+          <span
+            class="mono {{ 'text-emerald-300' if (pnl or 0) >= 0 else 'text-rose-300' }}"
+            >{% if pnl is not none %}{{ '+' if pnl >= 0 else '' }}${{
+            '%.2f'|format(pnl) }}{% else %}-{% endif %}</span
+          >
+        </div>
+      </div>
+    </div>
+    {% endif %} {% if order %}
+    <div class="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+      <p class="mb-2 text-xs uppercase tracking-wide text-slate-400">
+        Order Snapshot
+      </p>
+      <div class="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+        <div>
+          <span class="text-slate-400">Order ID:</span>
+          <span class="mono">{{ order.order_id }}</span>
+          {% if order.order_id %}
+          <button
+            class="ml-1 rounded border border-slate-700 px-1 py-0.5 text-[10px] text-slate-300 hover:bg-slate-800"
+            onclick="navigator.clipboard.writeText('{{ order.order_id }}')"
+          >
+            Copy
+          </button>
+          {% endif %}
+        </div>
+        <div>
+          <span class="text-slate-400">Status:</span>
+          <span class="mono">{{ order.status or '-' }}</span>
+        </div>
+        <div>
+          <span class="text-slate-400">Limit:</span>
+          <span class="mono">{{ '%.4f'|format(order.limit_price or 0) }}</span>
+        </div>
+        <div>
+          <span class="text-slate-400">Filled:</span>
+          <span class="mono"
+            >{{ '%.2f'|format(order.filled_tokens or 0) }}/{{
+            '%.2f'|format(order.size_tokens or 0) }}</span
+          >
+        </div>
+        <div>
+          <span class="text-slate-400">Size:</span>
+          <span class="mono">${{ '%.2f'|format(order.size_usdc or 0) }}</span>
+        </div>
+        <div>
+          <span class="text-slate-400">Fair:</span>
+          <span class="mono">{{ '%.4f'|format(order.fair_value or 0) }}</span>
+        </div>
+        <div>
+          <span class="text-slate-400">Edge:</span>
+          <span class="mono"
+            >{{ '%.2f'|format((order.edge or 0) * 100) }}pp</span
+          >
+        </div>
+        <div>
+          <span class="text-slate-400">Asset:</span>
+          <span class="mono">{{ order.asset or '-' }}</span>
+        </div>
+        <div>
+          <span class="text-slate-400">Token ID:</span>
+          <span class="mono">{{ order.token_id or '-' }}</span>
+          {% if order.token_id %}
+          <button
+            class="ml-1 rounded border border-slate-700 px-1 py-0.5 text-[10px] text-slate-300 hover:bg-slate-800"
+            onclick="navigator.clipboard.writeText('{{ order.token_id }}')"
+          >
+            Copy
+          </button>
+          {% endif %}
+        </div>
+        <div>
+          <span class="text-slate-400">Condition ID:</span>
+          <span class="mono">{{ order.condition_id or '-' }}</span>
+          {% if order.condition_id %}
+          <button
+            class="ml-1 rounded border border-slate-700 px-1 py-0.5 text-[10px] text-slate-300 hover:bg-slate-800"
+            onclick="navigator.clipboard.writeText('{{ order.condition_id }}')"
+          >
+            Copy
+          </button>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+    {% endif %}
+
+    <div class="rounded-lg border border-slate-800 bg-slate-950/60 p-3">
+      <p class="mb-2 text-xs uppercase tracking-wide text-slate-400">
+        Lifecycle Timeline (latest {{ timeline|length }})
+      </p>
+      <div class="max-h-[360px] overflow-auto">
+        <table class="min-w-full text-xs">
+          <thead class="sticky top-0 bg-slate-950/95 text-slate-400">
+            <tr>
+              <th class="px-2 py-2 text-left">Time</th>
+              <th class="px-2 py-2 text-left">Event</th>
+              <th class="px-2 py-2 text-left">Note</th>
+              <th class="px-2 py-2 text-right">Price</th>
+              <th class="px-2 py-2 text-right">Tokens</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for evt in timeline %}
+            <tr class="border-t border-slate-800/70">
+              <td class="px-2 py-2 text-slate-300">{{ evt.ts_display }}</td>
+              <td class="px-2 py-2 text-cyan-300">{{ evt.event or '-' }}</td>
+              <td class="px-2 py-2 text-slate-400">
+                {{ evt.note or evt.exit_reason or '-' }}
+              </td>
+              <td class="mono px-2 py-2 text-right text-slate-300">
+                {{ '%.4f'|format(evt.fill_price or evt.exit_price or
+                evt.limit_price or 0) if (evt.fill_price or evt.exit_price or
+                evt.limit_price) is not none else '-' }}
+              </td>
+              <td class="mono px-2 py-2 text-right text-slate-300">
+                {{ '%.2f'|format(evt.fill_tokens or evt.closed_tokens or
+                evt.size_tokens or 0) if (evt.fill_tokens or evt.closed_tokens
+                or evt.size_tokens) is not none else '-' }}
+              </td>
+            </tr>
+            {% else %}
+            <tr>
+              <td colspan="5" class="px-2 py-3 text-center text-slate-500">
+                No timeline events found for this selection.
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+</div>

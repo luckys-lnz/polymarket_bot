@@ -1,0 +1,190 @@
+<div class="space-y-4">
+  <form
+    class="grid gap-2 rounded-lg border border-slate-800 bg-slate-950/60 p-3 md:grid-cols-4"
+    hx-get="/fragments/positions{{ token_suffix }}"
+    hx-target="#positions-panel"
+    hx-swap="innerHTML"
+    hx-trigger="load, keyup changed delay:350ms"
+  >
+    <input
+      type="text"
+      name="q"
+      value="{{ positions_q }}"
+      placeholder="Search market text"
+      class="w-full rounded border border-slate-700 bg-slate-900 px-2 py-2 text-sm text-slate-100 outline-none ring-cyan-400 focus:ring"
+    />
+    <select
+      name="asset"
+      class="w-full rounded border border-slate-700 bg-slate-900 px-2 py-2 text-sm text-slate-100 outline-none ring-cyan-400 focus:ring"
+    >
+      <option value="all" {{ 'selected' if positions_asset == 'ALL' else '' }}>All assets</option>
+      {% for item in asset_options %}
+      <option value="{{ item }}" {{ 'selected' if positions_asset == item else '' }}>{{ item }}</option>
+      {% endfor %}
+    </select>
+    <select
+      name="sort_open"
+      class="w-full rounded border border-slate-700 bg-slate-900 px-2 py-2 text-sm text-slate-100 outline-none ring-cyan-400 focus:ring"
+    >
+      <option value="entry_desc" {{ 'selected' if sort_open == 'entry_desc' else '' }}>Open: newest first</option>
+      <option value="entry_asc" {{ 'selected' if sort_open == 'entry_asc' else '' }}>Open: oldest first</option>
+      <option value="edge_desc" {{ 'selected' if sort_open == 'edge_desc' else '' }}>Open: highest edge</option>
+      <option value="size_desc" {{ 'selected' if sort_open == 'size_desc' else '' }}>Open: largest size</option>
+    </select>
+    <select
+      name="sort_closed"
+      class="w-full rounded border border-slate-700 bg-slate-900 px-2 py-2 text-sm text-slate-100 outline-none ring-cyan-400 focus:ring"
+    >
+      <option value="exit_desc" {{ 'selected' if sort_closed == 'exit_desc' else '' }}>Closed: newest first</option>
+      <option value="exit_asc" {{ 'selected' if sort_closed == 'exit_asc' else '' }}>Closed: oldest first</option>
+      <option value="pnl_desc" {{ 'selected' if sort_closed == 'pnl_desc' else '' }}>Closed: best P&L</option>
+      <option value="pnl_asc" {{ 'selected' if sort_closed == 'pnl_asc' else '' }}>Closed: worst P&L</option>
+    </select>
+  </form>
+
+  <div>
+    <h3 class="mb-2 text-sm font-semibold text-cyan-300">
+      Open Positions ({{ open_rows|length }})
+    </h3>
+    <div class="overflow-x-auto rounded-lg border border-slate-800">
+      <table class="min-w-full text-sm">
+        <thead
+          class="sticky top-0 bg-slate-950/95 text-xs uppercase tracking-wide text-slate-400"
+        >
+          <tr>
+            <th class="px-3 py-2 text-left">Market</th>
+            <th class="px-3 py-2 text-left">Asset</th>
+            <th class="px-3 py-2 text-left">Side</th>
+            <th class="px-3 py-2 text-right">Entry</th>
+            <th class="hidden px-3 py-2 text-right md:table-cell">Tokens</th>
+            <th class="px-3 py-2 text-right">Size</th>
+            <th class="hidden px-3 py-2 text-right lg:table-cell">Edge</th>
+            <th class="hidden px-3 py-2 text-left lg:table-cell">Opened</th>
+            <th class="px-3 py-2 text-left">Detail</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in open_rows %}
+          <tr class="border-t border-slate-800/80 hover:bg-slate-800/25">
+            <td class="max-w-[520px] px-3 py-2 align-top text-slate-100">
+              <details>
+                <summary class="cursor-pointer">{{ row.market_question[:100] }}{% if row.market_question|length > 100 %}...{% endif %}</summary>
+                <p class="mt-2 whitespace-normal text-xs text-slate-300">{{ row.market_question }}</p>
+              </details>
+            </td>
+            <td class="px-3 py-2 align-top text-slate-300">
+              {{ row.asset or '-' }}
+            </td>
+            <td class="px-3 py-2 align-top text-slate-300">
+              {{ row.held_outcome }}
+            </td>
+            <td class="mono px-3 py-2 text-right align-top">
+              {{ '%.4f'|format(row.entry_price or 0) }}
+            </td>
+            <td class="mono hidden px-3 py-2 text-right align-top md:table-cell">
+              {{ '%.2f'|format(row.size_tokens or 0) }}
+            </td>
+            <td class="mono px-3 py-2 text-right align-top">
+              ${{ '%.2f'|format(row.size_usdc or 0) }}
+            </td>
+            <td class="mono hidden px-3 py-2 text-right align-top text-emerald-300 lg:table-cell">
+              {{ '%.2f'|format((row.edge_at_entry or 0) * 100) }}pp
+            </td>
+            <td class="hidden px-3 py-2 align-top text-slate-400 lg:table-cell">
+              {{ row.entry_at }}
+            </td>
+            <td class="px-3 py-2 align-top">
+              <button
+                type="button"
+                class="rounded border border-cyan-700/70 px-2 py-1 text-xs text-cyan-200 hover:bg-cyan-900/30"
+                onclick="window.dashboardUiHold(3000); return !window.dashboardDetailPinned;"
+                hx-get="/fragments/detail{{ token_suffix }}"
+                hx-vals='{{ {"kind": "position", "market_question": row.market_question}|tojson }}'
+                hx-target="#detail-panel"
+                hx-swap="innerHTML"
+              >Inspect</button>
+            </td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="9" class="px-3 py-3 text-center text-slate-500">
+              No open positions.
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div>
+    <h3 class="mb-2 text-sm font-semibold text-amber-300">
+      Recent Closed Positions ({{ closed_rows|length }})
+    </h3>
+    <div class="overflow-x-auto rounded-lg border border-slate-800">
+      <table class="min-w-full text-sm">
+        <thead
+          class="sticky top-0 bg-slate-950/95 text-xs uppercase tracking-wide text-slate-400"
+        >
+          <tr>
+            <th class="px-3 py-2 text-left">Market</th>
+            <th class="hidden px-3 py-2 text-left md:table-cell">Reason</th>
+            <th class="px-3 py-2 text-right">Entry</th>
+            <th class="px-3 py-2 text-right">Exit</th>
+            <th class="px-3 py-2 text-right">P&L</th>
+            <th class="hidden px-3 py-2 text-left lg:table-cell">Closed</th>
+            <th class="px-3 py-2 text-left">Detail</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in closed_rows %} {% set pnl = (row.partial_tp_realised_pnl
+          or 0) + ((row.exit_price or 0) - (row.entry_price or 0)) *
+          (row.size_tokens or 0) %}
+          <tr class="border-t border-slate-800/80 hover:bg-slate-800/25">
+            <td class="max-w-[580px] px-3 py-2 align-top text-slate-100">
+              <details>
+                <summary class="cursor-pointer">{{ row.market_question[:100] }}{% if row.market_question|length > 100 %}...{% endif %}</summary>
+                <p class="mt-2 whitespace-normal text-xs text-slate-300">{{ row.market_question }}</p>
+              </details>
+            </td>
+            <td class="hidden px-3 py-2 align-top text-slate-300 md:table-cell">
+              {{ row.exit_reason or '-' }}
+            </td>
+            <td class="mono px-3 py-2 text-right align-top">
+              {{ '%.4f'|format(row.entry_price or 0) }}
+            </td>
+            <td class="mono px-3 py-2 text-right align-top">
+              {{ '%.4f'|format(row.exit_price or 0) }}
+            </td>
+            <td
+              class="mono px-3 py-2 text-right align-top {{ 'text-emerald-300' if pnl >= 0 else 'text-rose-300' }}"
+            >
+              {{ '+' if pnl >= 0 else '' }}${{ '%.2f'|format(pnl) }}
+            </td>
+            <td class="hidden px-3 py-2 align-top text-slate-400 lg:table-cell">
+              {{ row.exit_at }}
+            </td>
+            <td class="px-3 py-2 align-top">
+              <button
+                type="button"
+                class="rounded border border-cyan-700/70 px-2 py-1 text-xs text-cyan-200 hover:bg-cyan-900/30"
+                onclick="window.dashboardUiHold(3000); return !window.dashboardDetailPinned;"
+                hx-get="/fragments/detail{{ token_suffix }}"
+                hx-vals='{{ {"kind": "position", "market_question": row.market_question}|tojson }}'
+                hx-target="#detail-panel"
+                hx-swap="innerHTML"
+              >Inspect</button>
+            </td>
+          </tr>
+          {% else %}
+          <tr>
+            <td colspan="7" class="px-3 py-3 text-center text-slate-500">
+              No closed positions yet.
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
