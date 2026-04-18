@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from html import escape
 from typing import Awaitable, Callable, Optional
 
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -17,6 +18,7 @@ def _mask_token(text: str) -> str:
     # Match pattern: digits:alphanumeric_with_dash
     return re.sub(r'\d+:[A-Za-z0-9_-]+', '/telegram_token', text)
 
+
 log = logging.getLogger(__name__)
 
 _ESCAPE = str.maketrans({
@@ -27,25 +29,32 @@ _ESCAPE = str.maketrans({
     ".": r"\.", "!": r"\!",
 })
 
+
 def _esc(text: str) -> str:
     """Escape text for Telegram MarkdownV2."""
     return str(text).translate(_ESCAPE)
+
+
+def _html(text: object) -> str:
+    """Escape dynamic text for Telegram HTML parse mode."""
+    return escape(str(text), quote=False)
+
 
 _APPROVAL_TIMEOUT = 600  # 10 minutes
 
 
 def _scorecard(stats) -> str:
-    """Format running scorecard as a Telegram string. Empty string if no trades yet."""
+    """Format running scorecard as Telegram HTML. Empty string if no trades yet."""
     if stats is None or stats.total_trades == 0:
         return ""
     sign = "+" if stats.total_pnl >= 0 else ""
-    sl_r = stats.stop_losses  / stats.total_trades * 100
+    sl_r = stats.stop_losses / stats.total_trades * 100
     tp_r = stats.take_profits / stats.total_trades * 100
     return (
-        f"\n\n📊 *Scorecard ({stats.total_trades} trades)*\n"
-        f"`{stats.wins}W/{stats.losses}L`  win `{stats.win_rate*100:.0f}%`\n"
-        f"P&L `{sign}${stats.total_pnl:.2f}`  ROI `{sign}{stats.roi:.1f}%`\n"
-        f"TP exits `{tp_r:.0f}%`  SL exits `{sl_r:.0f}%`  avg `{sign}${stats.avg_pnl:.2f}`"
+        f"\n\n📊 <b>Scorecard ({stats.total_trades} trades)</b>\n"
+        f"<code>{stats.wins}W/{stats.losses}L</code>  win <code>{stats.win_rate*100:.0f}%</code>\n"
+        f"P&amp;L <code>{sign}${stats.total_pnl:.2f}</code>  ROI <code>{sign}{stats.roi:.1f}%</code>\n"
+        f"TP exits <code>{tp_r:.0f}%</code>  SL exits <code>{sl_r:.0f}%</code>  avg <code>{sign}${stats.avg_pnl:.2f}</code>"
     )
 
 
@@ -53,26 +62,26 @@ class TelegramNotifier:
     """Single class for all Telegram communication. One responsibility: send messages."""
 
     def __init__(self, token: str, chat_id: int) -> None:
-        self._token     = token
-        self._chat_id   = chat_id
-        self._bot       = Bot(token=token)
-        self._pending:  dict[str, asyncio.Future[bool]] = {}
-        self._app:      Optional[Application] = None
+        self._token = token
+        self._chat_id = chat_id
+        self._bot = Bot(token=token)
+        self._pending: dict[str, asyncio.Future[bool]] = {}
+        self._app: Optional[Application] = None
         self._bot_ready = False
-        self._bot_lock  = asyncio.Lock()
+        self._bot_lock = asyncio.Lock()
         self._report_provider: Optional[Callable[[], Awaitable[None]]] = None
         self.paper_mode = False
 
     @classmethod
     def from_env(cls) -> TelegramNotifier:
-        token   = os.environ.get("TELEGRAM_TOKEN")
+        token = os.environ.get("TELEGRAM_TOKEN")
         chat_id = os.environ.get("TELEGRAM_CHAT_ID")
         if not token or not chat_id:
             raise EnvironmentError("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID must be set")
         return cls(token=token, chat_id=int(chat_id))
 
     def _tag(self) -> str:
-        return "📄 *[PAPER]* " if self.paper_mode else ""
+        return "📄 <b>[PAPER]</b> " if self.paper_mode else ""
 
     def set_report_provider(self, provider: Callable[[], Awaitable[None]]) -> None:
         self._report_provider = provider
@@ -109,38 +118,50 @@ class TelegramNotifier:
         try:
             await self._ensure_bot()
             await self._bot.send_message(
-                chat_id=self._chat_id, text=message, parse_mode="Markdown"
+                chat_id=self._chat_id,
+                text=message,
+                parse_mode="HTML",
             )
         except Exception as exc:
             log.warning("Telegram send failed: %s", _mask_token(str(exc)))
-            # Fallback to plain text (no Markdown) so notifications still arrive.
             try:
                 await self._ensure_bot()
-                await self._bot.send_message(
-                    chat_id=self._chat_id, text=message
-                )
+                await self._bot.send_message(chat_id=self._chat_id, text=message)
             except Exception as exc2:
                 log.warning("Telegram plain send failed: %s", _mask_token(str(exc2)))
 
     async def send_entry_notification(
-        self, *, market: str, held_outcome: str, entry_price: float,
-        fair_value: float, edge: float, size_usdc: float, size_tokens: float,
-        kelly_pct: float, days_to_expiry: float, spot_price: float,
-        asset: str, stats=None,
+        self,
+        *,
+        market: str,
+        held_outcome: str,
+        entry_price: float,
+        fair_value: float,
+        edge: float,
+        size_usdc: float,
+        size_tokens: float,
+        kelly_pct: float,
+        days_to_expiry: float,
+        spot_price: float,
+        asset: str,
+        stats=None,
     ) -> None:
-        desc = ("market underpricing this outcome"
-                if held_outcome == "YES" else "market overpricing this outcome")
+        desc = (
+            "market underpricing this outcome"
+            if held_outcome == "YES"
+            else "market overpricing this outcome"
+        )
         msg = (
-            f"{self._tag()}🟢 *Trade Entered*\n\n"
-            f"*{_esc(market[:70])}*\n\n"
-            f"*Bought:* {held_outcome} token\n"
-            f"*Why:* Model {fair_value*100:.1f}% vs market {entry_price*100:.1f}% — {desc}\n\n"
-            f"*Entry:* `{entry_price:.4f}` ({entry_price*100:.1f}%)\n"
-            f"*Fair:*  `{fair_value:.4f}` ({fair_value*100:.1f}%)\n"
-            f"*Edge:*  `+{edge*100:.1f}pp`\n\n"
-            f"*Size:* `{size_tokens:.2f} tokens` (${size_usdc:.2f})\n"
-            f"*Kelly:* `{kelly_pct:.0f}%`  *Expires:* `{days_to_expiry:.1f}d`\n"
-            f"*{asset} spot:* `${spot_price:,.2f}`"
+            f"{self._tag()}🟢 <b>Trade Entered</b>\n\n"
+            f"<b>{_html(market[:70])}</b>\n\n"
+            f"<b>Bought:</b> {_html(held_outcome)} token\n"
+            f"<b>Why:</b> Model {fair_value*100:.1f}% vs market {entry_price*100:.1f}% — {_html(desc)}\n\n"
+            f"<b>Entry:</b> <code>{entry_price:.4f}</code> ({entry_price*100:.1f}%)\n"
+            f"<b>Fair:</b> <code>{fair_value:.4f}</code> ({fair_value*100:.1f}%)\n"
+            f"<b>Edge:</b> <code>+{edge*100:.1f}pp</code>\n\n"
+            f"<b>Size:</b> <code>{size_tokens:.2f} tokens</code> (${size_usdc:.2f})\n"
+            f"<b>Kelly:</b> <code>{kelly_pct:.0f}%</code>  <b>Expires:</b> <code>{days_to_expiry:.1f}d</code>\n"
+            f"<b>{_html(asset)} spot:</b> ${spot_price:,.2f}"
             f"{_scorecard(stats)}"
         )
         await self.send(msg)
@@ -159,141 +180,194 @@ class TelegramNotifier:
         reason: str,
     ) -> None:
         msg = (
-            f"{self._tag()}📌 *Order Placed*\n\n"
-            f"*{_esc(market[:70])}*\n\n"
-            f"*Stage:* {stage}\n"
-            f"*Action:* {side} {held_outcome}\n"
-            f"*Reason:* {reason}\n\n"
-            f"*Limit:* `{order_price:.4f}`\n"
-            f"*Size:* `{size_tokens:.2f} tokens` (${size_usdc:.2f})\n"
-            f"*Order ID:* `{_esc(order_id)}`"
+            f"{self._tag()}📌 <b>Order Placed</b>\n\n"
+            f"<b>{_html(market[:70])}</b>\n\n"
+            f"<b>Stage:</b> {_html(stage)}\n"
+            f"<b>Action:</b> {_html(side)} {_html(held_outcome)}\n"
+            f"<b>Reason:</b> {_html(reason)}\n\n"
+            f"<b>Limit:</b> <code>{order_price:.4f}</code>\n"
+            f"<b>Size:</b> <code>{size_tokens:.2f} tokens</code> (${size_usdc:.2f})\n"
+            f"<b>Order ID:</b> <code>{_html(order_id)}</code>"
         )
         await self.send(msg)
 
     async def send_stop_loss_notification(
-        self, *, market: str, held_outcome: str, entry_price: float,
-        exit_price: float, fair_value_now: float, size_usdc: float,
-        pnl: float, pnl_pct: float, reason: str, stats=None,
+        self,
+        *,
+        market: str,
+        held_outcome: str,
+        entry_price: float,
+        exit_price: float,
+        fair_value_now: float,
+        size_usdc: float,
+        pnl: float,
+        pnl_pct: float,
+        reason: str,
+        stats=None,
     ) -> None:
         sign = "+" if pnl >= 0 else ""
         msg = (
-            f"{self._tag()}🔴 *Stop-Loss Triggered*\n\n"
-            f"*{_esc(market[:70])}*\n\n"
-            f"*Held:* {held_outcome}  *Why:* {reason}\n\n"
-            f"*Entry:* `{entry_price:.4f}`  *Exit:* `{exit_price:.4f}`\n"
-            f"*Fair now:* `{fair_value_now:.4f}`\n\n"
-            f"*Size:* ${size_usdc:.2f}\n"
-            f"📉 *P&L:* `{sign}${pnl:.2f}` (`{sign}{pnl_pct:.1f}%`)"
+            f"{self._tag()}🔴 <b>Stop-Loss Triggered</b>\n\n"
+            f"<b>{_html(market[:70])}</b>\n\n"
+            f"<b>Held:</b> {_html(held_outcome)}  <b>Why:</b> {_html(reason)}\n\n"
+            f"<b>Entry:</b> <code>{entry_price:.4f}</code>  <b>Exit:</b> <code>{exit_price:.4f}</code>\n"
+            f"<b>Fair now:</b> <code>{fair_value_now:.4f}</code>\n\n"
+            f"<b>Size:</b> ${size_usdc:.2f}\n"
+            f"📉 <b>P&amp;L:</b> <code>{sign}${pnl:.2f}</code> (<code>{sign}{pnl_pct:.1f}%</code>)"
             f"{_scorecard(stats)}"
         )
         await self.send(msg)
 
     async def send_take_profit_notification(
-        self, *, market: str, held_outcome: str, entry_price: float,
-        exit_price: float, fair_value_now: float, size_usdc: float,
-        pnl: float, pnl_pct: float, edge_at_entry: float, edge_now: float, stats=None,
+        self,
+        *,
+        market: str,
+        held_outcome: str,
+        entry_price: float,
+        exit_price: float,
+        fair_value_now: float,
+        size_usdc: float,
+        pnl: float,
+        pnl_pct: float,
+        edge_at_entry: float,
+        edge_now: float,
+        stats=None,
     ) -> None:
         sign = "+" if pnl >= 0 else ""
         msg = (
-            f"{self._tag()}✅ *Take-Profit Triggered*\n\n"
-            f"*{_esc(market[:70])}*\n\n"
-            f"*Held:* {held_outcome}\n"
-            f"*Why:* Edge decayed from {edge_at_entry*100:.1f}pp to {edge_now*100:.1f}pp\n\n"
-            f"*Entry:* `{entry_price:.4f}`  *Exit:* `{exit_price:.4f}`\n"
-            f"*Fair now:* `{fair_value_now:.4f}`\n\n"
-            f"*Size:* ${size_usdc:.2f}\n"
-            f"📈 *P&L:* `{sign}${pnl:.2f}` (`{sign}{pnl_pct:.1f}%`)"
+            f"{self._tag()}✅ <b>Take-Profit Triggered</b>\n\n"
+            f"<b>{_html(market[:70])}</b>\n\n"
+            f"<b>Held:</b> {_html(held_outcome)}\n"
+            f"<b>Why:</b> Edge decayed from {edge_at_entry*100:.1f}pp to {edge_now*100:.1f}pp\n\n"
+            f"<b>Entry:</b> <code>{entry_price:.4f}</code>  <b>Exit:</b> <code>{exit_price:.4f}</code>\n"
+            f"<b>Fair now:</b> <code>{fair_value_now:.4f}</code>\n\n"
+            f"<b>Size:</b> ${size_usdc:.2f}\n"
+            f"📈 <b>P&amp;L:</b> <code>{sign}${pnl:.2f}</code> (<code>{sign}{pnl_pct:.1f}%</code>)"
             f"{_scorecard(stats)}"
         )
         await self.send(msg)
 
     async def send_partial_take_profit_notification(
-        self, *, market: str, held_outcome: str, entry_price: float,
-        exit_price: float, fair_value_now: float, closed_tokens: float,
-        closed_usdc: float, pnl: float, remaining_tokens: float, stats=None,
+        self,
+        *,
+        market: str,
+        held_outcome: str,
+        entry_price: float,
+        exit_price: float,
+        fair_value_now: float,
+        closed_tokens: float,
+        closed_usdc: float,
+        pnl: float,
+        remaining_tokens: float,
+        stats=None,
     ) -> None:
         sign = "+" if pnl >= 0 else ""
         msg = (
-            f"{self._tag()}🟡 *Partial Take-Profit Triggered*\n\n"
-            f"*{_esc(market[:70])}*\n\n"
-            f"*Held:* {held_outcome}\n"
-            f"*Why:* Position captured target upside; scaling out\n\n"
-            f"*Entry:* `{entry_price:.4f}`  *Partial Exit:* `{exit_price:.4f}`\n"
-            f"*Fair now:* `{fair_value_now:.4f}`\n\n"
-            f"*Closed:* `{closed_tokens:.2f} tokens` (${closed_usdc:.2f})\n"
-            f"*Remaining:* `{remaining_tokens:.2f} tokens`\n"
-            f"📈 *Realised P&L (partial):* `{sign}${pnl:.2f}`"
+            f"{self._tag()}🟡 <b>Partial Take-Profit Triggered</b>\n\n"
+            f"<b>{_html(market[:70])}</b>\n\n"
+            f"<b>Held:</b> {_html(held_outcome)}\n"
+            f"<b>Why:</b> Position captured target upside; scaling out\n\n"
+            f"<b>Entry:</b> <code>{entry_price:.4f}</code>  <b>Partial Exit:</b> <code>{exit_price:.4f}</code>\n"
+            f"<b>Fair now:</b> <code>{fair_value_now:.4f}</code>\n\n"
+            f"<b>Closed:</b> <code>{closed_tokens:.2f} tokens</code> (${closed_usdc:.2f})\n"
+            f"<b>Remaining:</b> <code>{remaining_tokens:.2f} tokens</code>\n"
+            f"📈 <b>Realised P&amp;L (partial):</b> <code>{sign}${pnl:.2f}</code>"
             f"{_scorecard(stats)}"
         )
         await self.send(msg)
 
     async def send_time_stop_notification(
-        self, *, market: str, held_outcome: str, entry_price: float,
-        exit_price: float, fair_value_now: float, size_usdc: float,
-        pnl: float, pnl_pct: float, expiry_progress: float, stats=None,
+        self,
+        *,
+        market: str,
+        held_outcome: str,
+        entry_price: float,
+        exit_price: float,
+        fair_value_now: float,
+        size_usdc: float,
+        pnl: float,
+        pnl_pct: float,
+        expiry_progress: float,
+        stats=None,
     ) -> None:
         sign = "+" if pnl >= 0 else ""
         msg = (
-            f"{self._tag()}⏱️ *Time-Stop Triggered*\n\n"
-            f"*{_esc(market[:70])}*\n\n"
-            f"*Held:* {held_outcome}\n"
-            f"*Why:* {expiry_progress*100:.0f}% of market lifetime elapsed with weak probability\n\n"
-            f"*Entry:* `{entry_price:.4f}`  *Exit:* `{exit_price:.4f}`\n"
-            f"*Fair now:* `{fair_value_now:.4f}`\n\n"
-            f"*Size:* ${size_usdc:.2f}\n"
-            f"📉 *P&L:* `{sign}${pnl:.2f}` (`{sign}{pnl_pct:.1f}%`)"
+            f"{self._tag()}⏱️ <b>Time-Stop Triggered</b>\n\n"
+            f"<b>{_html(market[:70])}</b>\n\n"
+            f"<b>Held:</b> {_html(held_outcome)}\n"
+            f"<b>Why:</b> {expiry_progress*100:.0f}% of market lifetime elapsed with weak probability\n\n"
+            f"<b>Entry:</b> <code>{entry_price:.4f}</code>  <b>Exit:</b> <code>{exit_price:.4f}</code>\n"
+            f"<b>Fair now:</b> <code>{fair_value_now:.4f}</code>\n\n"
+            f"<b>Size:</b> ${size_usdc:.2f}\n"
+            f"📉 <b>P&amp;L:</b> <code>{sign}${pnl:.2f}</code> (<code>{sign}{pnl_pct:.1f}%</code>)"
             f"{_scorecard(stats)}"
         )
         await self.send(msg)
 
     async def send_spike_alert(
-        self, *, asset: str, move_pct: float, price_from: float,
-        price_to: float, window_seconds: float, open_positions: int,
+        self,
+        *,
+        asset: str,
+        move_pct: float,
+        price_from: float,
+        price_to: float,
+        window_seconds: float,
+        open_positions: int,
     ) -> None:
         direction = "surged" if move_pct > 0 else "dropped"
-        pos_text  = f"{open_positions} {asset} position{'s' if open_positions != 1 else ''}"
+        pos_text = f"{open_positions} {asset} position{'s' if open_positions != 1 else ''}"
         msg = (
-            f"{self._tag()}⚡ *{asset} {direction} {move_pct*100:+.2f}%*\n"
-            f"`${price_from:,.0f}` → `${price_to:,.0f}` in `{window_seconds:.0f}s`\n"
-            f"Re-evaluating {pos_text} for TP/SL exits."
+            f"{self._tag()}⚡ <b>{_html(asset)} {direction} {move_pct*100:+.2f}%</b>\n"
+            f"<code>${price_from:,.0f}</code> → <code>${price_to:,.0f}</code> in <code>{window_seconds:.0f}s</code>\n"
+            f"Re-evaluating {_html(pos_text)} for TP/SL exits."
         )
         await self.send(msg)
 
     async def send_daily_summary(
-        self, *, open_positions: list[dict], closed_today: list[dict],
-        total_realised_pnl: float, total_unrealised_pnl: float,
-        win_rate: Optional[float], bankroll: float, deployed: float, stats=None,
+        self,
+        *,
+        open_positions: list[dict],
+        closed_today: list[dict],
+        total_realised_pnl: float,
+        total_unrealised_pnl: float,
+        win_rate: Optional[float],
+        bankroll: float,
+        deployed: float,
+        stats=None,
         analytics_summary: Optional[dict] = None,
     ) -> None:
         sign_r = "+" if total_realised_pnl >= 0 else ""
         sign_u = "+" if total_unrealised_pnl >= 0 else ""
-        lines  = [
-            f"{self._tag()}📊 *Daily Summary*\n",
-            f"Bankroll `${bankroll:,.2f}`  Deployed `${deployed:,.2f}`",
-            f"Realised `{sign_r}${total_realised_pnl:.2f}`  Unrealised `{sign_u}${total_unrealised_pnl:.2f}`",
+        lines = [
+            f"{self._tag()}📊 <b>Daily Summary</b>\n",
+            f"Bankroll <code>${bankroll:,.2f}</code>  Deployed <code>${deployed:,.2f}</code>",
+            f"Realised <code>{sign_r}${total_realised_pnl:.2f}</code>  Unrealised <code>{sign_u}${total_unrealised_pnl:.2f}</code>",
         ]
         if stats and stats.total_trades > 0:
             sign = "+" if stats.total_pnl >= 0 else ""
             lines += [
-                f"\n*All-time ({stats.total_trades} trades):*",
-                f"Win rate `{stats.win_rate*100:.0f}%` ({stats.wins}W/{stats.losses}L)",
-                f"Total P&L `{sign}${stats.total_pnl:.2f}`  ROI `{sign}{stats.roi:.1f}%`",
-                f"TP exits `{stats.take_profits/stats.total_trades*100:.0f}%`  "
-                f"SL exits `{stats.stop_losses/stats.total_trades*100:.0f}%`",
+                f"\n<b>All-time ({stats.total_trades} trades):</b>",
+                f"Win rate <code>{stats.win_rate*100:.0f}%</code> ({stats.wins}W/{stats.losses}L)",
+                f"Total P&amp;L <code>{sign}${stats.total_pnl:.2f}</code>  ROI <code>{sign}{stats.roi:.1f}%</code>",
+                f"TP exits <code>{stats.take_profits/stats.total_trades*100:.0f}%</code>  SL exits <code>{stats.stop_losses/stats.total_trades*100:.0f}%</code>",
             ]
         if closed_today:
-            lines.append(f"\n*Closed today ({len(closed_today)}):*")
+            lines.append(f"\n<b>Closed today ({len(closed_today)}):</b>")
             for p in closed_today[:8]:
-                pnl, sign = p.get("pnl", 0), "+" if p.get("pnl", 0) >= 0 else ""
+                pnl = p.get("pnl", 0)
+                sign = "+" if pnl >= 0 else ""
                 icon = "\u2705" if pnl >= 0 else "\u274c"
-                lines.append(f"{icon} {_esc(p['market'][:45])}... `{sign}${pnl:.2f}` {p.get('reason','')}")
+                lines.append(
+                    f"{icon} {_html(p['market'][:45])}... <code>{sign}${pnl:.2f}</code> {_html(p.get('reason', ''))}"
+                )
         if open_positions:
-            lines.append(f"\n*Open ({len(open_positions)}):*")
+            lines.append(f"\n<b>Open ({len(open_positions)}):</b>")
             for p in open_positions[:8]:
-                upnl, sign = p.get("unrealised_pnl", 0), "+" if p.get("unrealised_pnl", 0) >= 0 else ""
-                lines.append(f"\u2022 {_esc(p['market'][:45])}... uP&L `{sign}${upnl:.2f}`")
+                upnl = p.get("unrealised_pnl", 0)
+                sign = "+" if upnl >= 0 else ""
+                lines.append(f"\u2022 {_html(p['market'][:45])}... uP&amp;L <code>{sign}${upnl:.2f}</code>")
         else:
-            lines.append("\n_No open positions_")
+            lines.append("\n<i>No open positions</i>")
 
         if analytics_summary:
             totals = analytics_summary.get("totals", {}) if isinstance(analytics_summary, dict) else {}
@@ -303,34 +377,34 @@ class TelegramNotifier:
             diagnostics = analytics_summary.get("diagnostics", []) if isinstance(analytics_summary, dict) else []
 
             lines += [
-                "\n*Analytics:*",
-                f"Closed `{int(totals.get('closed_trades', 0))}`  Wins `{int(totals.get('wins', 0))}`  Losses `{int(totals.get('losses', 0))}`",
-                f"Avg hold `{float(totals.get('avg_hold_minutes', 0.0)):.1f}m`  Avg return `{float(totals.get('avg_return_pct', 0.0)):+.1f}%`",
-                f"24h P&L `{float(last_24h.get('realised_pnl', 0.0)):+.2f}`  24h win `{float(last_24h.get('win_rate', 0.0))*100:.0f}%`",
+                "\n<b>Analytics:</b>",
+                f"Closed <code>{int(totals.get('closed_trades', 0))}</code>  Wins <code>{int(totals.get('wins', 0))}</code>  Losses <code>{int(totals.get('losses', 0))}</code>",
+                f"Avg hold <code>{float(totals.get('avg_hold_minutes', 0.0)):.1f}m</code>  Avg return <code>{float(totals.get('avg_return_pct', 0.0)):+.1f}%</code>",
+                f"24h P&amp;L <code>{float(last_24h.get('realised_pnl', 0.0)):+.2f}</code>  24h win <code>{float(last_24h.get('win_rate', 0.0))*100:.0f}%</code>",
             ]
 
             if exit_breakdown:
                 exit_line = "  ".join(
-                    f"{_esc(str(item.get('name', '?')))} `{int(item.get('count', 0))}`"
+                    f"{_html(str(item.get('name', '?')))} <code>{int(item.get('count', 0))}</code>"
                     for item in exit_breakdown[:4]
                 )
                 lines.append(f"Exits {exit_line}")
 
             if failures:
-                lines.append("\n*Top frictions:*")
+                lines.append("\n<b>Top frictions:</b>")
                 for item in failures[:3]:
-                    category = _esc(str(item.get("category", "?")))
-                    reason = _esc(str(item.get("reason", "unknown"))[:55])
+                    category = _html(str(item.get("category", "?")))
+                    reason = _html(str(item.get("reason", "unknown"))[:55])
                     count = int(item.get("count", 0))
-                    lines.append(f"• {category}: {reason} `{count}`")
+                    lines.append(f"• {category}: {reason} <code>{count}</code>")
 
             if diagnostics:
                 top = diagnostics[0]
-                severity = _esc(str(top.get("severity", "info")).upper())
-                issue = _esc(str(top.get("issue", "No diagnostic issue"))[:65])
-                tweak = _esc(str(top.get("suggested_tweak", ""))[:120])
+                severity = _html(str(top.get("severity", "info")).upper())
+                issue = _html(str(top.get("issue", "No diagnostic issue"))[:65])
+                tweak = _html(str(top.get("suggested_tweak", ""))[:120])
                 lines += [
-                    "\n*Main tweak suggestion:*",
+                    "\n<b>Main tweak suggestion:</b>",
                     f"{severity} {issue}",
                     tweak,
                 ]
@@ -338,25 +412,28 @@ class TelegramNotifier:
 
     async def request_approval(self, signal_id: str, message: str) -> bool:
         """Send signal with YES/NO buttons. Auto-trades after 10 min if no response."""
-        loop   = asyncio.get_event_loop()
+        loop = asyncio.get_event_loop()
         future: asyncio.Future[bool] = loop.create_future()
         self._pending[signal_id] = future
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ YES", callback_data=f"yes:{signal_id}"),
-            InlineKeyboardButton("❌ NO",  callback_data=f"no:{signal_id}"),
+            InlineKeyboardButton("❌ NO", callback_data=f"no:{signal_id}"),
         ]])
         try:
             await self._ensure_bot()
             await self._bot.send_message(
-                chat_id=self._chat_id, text=message,
-                parse_mode="Markdown", reply_markup=keyboard,
+                chat_id=self._chat_id,
+                text=message,
+                parse_mode="Markdown",
+                reply_markup=keyboard,
             )
         except Exception as exc:
             log.warning("Approval send failed: %s — retrying without Markdown", _mask_token(str(exc)))
             try:
                 await self._ensure_bot()
                 await self._bot.send_message(
-                    chat_id=self._chat_id, text=message,
+                    chat_id=self._chat_id,
+                    text=message,
                     reply_markup=keyboard,
                 )
             except Exception as exc2:
@@ -367,11 +444,11 @@ class TelegramNotifier:
             return await asyncio.wait_for(future, timeout=_APPROVAL_TIMEOUT)
         except asyncio.TimeoutError:
             self._pending.pop(signal_id, None)
-            await self.send(f"⏰ No response for `{signal_id}` — auto-trading.")
+            await self.send(f"⏰ No response for <code>{_html(signal_id)}</code> — auto-trading.")
             return True
 
     async def _handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        query  = update.callback_query
+        query = update.callback_query
         await query.answer()
         action, _, signal_id = (query.data or "").partition(":")
         future = self._pending.pop(signal_id, None)
@@ -380,7 +457,7 @@ class TelegramNotifier:
             return
         future.set_result(action == "yes")
         label = "✅ Approved" if action == "yes" else "❌ Skipped"
-        await query.edit_message_text(f"{label} `{signal_id}`", parse_mode="Markdown")
+        await query.edit_message_text(f"{label} <code>{_html(signal_id)}</code>", parse_mode="HTML")
 
     async def _handle_report_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.effective_message
