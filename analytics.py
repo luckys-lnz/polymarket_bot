@@ -96,6 +96,12 @@ class TradeAnalyticsJournal:
         slippage_bps = 0.0
         if order.limit_price > 0:
             slippage_bps = ((fill_price - order.limit_price) / order.limit_price) * 10000
+
+        # Phase 0: Compute fees (Polymarket maker+settlement: 20bp + 50bp)
+        fees_bps = 70.0  # 20bp maker + 50bp settlement
+        fill_usdc = fill_price * fill_tokens
+        fees_usdc = (fill_usdc * fees_bps) / 10000.0
+
         self.log_event(
             "entry_fill",
             order_id=order.order_id,
@@ -106,7 +112,9 @@ class TradeAnalyticsJournal:
             side=order.side,
             fill_price=fill_price,
             fill_tokens=fill_tokens,
-            fill_usdc=fill_price * fill_tokens,
+            fill_usdc=fill_usdc,
+            fees_bps=fees_bps,
+            fees_usdc=round(fees_usdc, 4),
             total_filled_tokens=total_filled,
             order_limit_price=order.limit_price,
             slippage_bps=slippage_bps,
@@ -155,6 +163,16 @@ class TradeAnalyticsJournal:
         current_edge: float,
         expiry_progress: float,
     ) -> None:
+        # Phase 0: Compute gross vs net PnL with fee deduction
+        gross_pnl = position.realised_pnl
+
+        # Entry fees: entry_price * size_tokens * 70bps
+        entry_fees_usdc = (position.entry_price * position.size_tokens * 70.0) / 10000.0 if position.entry_price > 0 else 0.0
+        # Exit fees: exit_price * size_tokens * 70bps
+        exit_fees_usdc = (position.exit_price * position.size_tokens * 70.0) / 10000.0 if position.exit_price > 0 else 0.0
+        total_fees_usdc = entry_fees_usdc + exit_fees_usdc
+        net_pnl = gross_pnl - total_fees_usdc
+
         self.log_event(
             "final_exit",
             market_question=position.market_question,
@@ -171,6 +189,11 @@ class TradeAnalyticsJournal:
             fair_value_now=fair_value_now,
             edge_at_entry=position.edge_at_entry,
             current_edge=current_edge,
+            gross_pnl=round(gross_pnl, 4),
+            entry_fees_usdc=round(entry_fees_usdc, 4),
+            exit_fees_usdc=round(exit_fees_usdc, 4),
+            total_fees_usdc=round(total_fees_usdc, 4),
+            net_pnl=round(net_pnl, 4),
             pnl=position.realised_pnl,
             return_pct=position.return_pct,
             partial_tp_done=position.partial_tp_done,
@@ -196,6 +219,41 @@ class TradeAnalyticsJournal:
             with open(self._summary_path, encoding="utf-8") as fh:
                 payload = json.load(fh)
         return payload if isinstance(payload, dict) else {}
+
+    def compute_fill_quality(self, window: int = 50) -> dict[str, Any]:
+        """
+        Phase 0: Compute fill-quality metrics over rolling window.
+        Returns: {fill_ratio, cancel_to_fill, passes_quality_gate, order_count}
+        """
+        events = self._load_events_unlocked()
+        order_statuses = [e for e in events if e.get("event") == "order_status"]
+
+        # Look at last `window` order status events
+        recent = order_statuses[-window:] if order_statuses else []
+
+        if not recent:
+            return {
+                "fill_ratio": 1.0,
+                "cancel_to_fill": 0.0,
+                "passes_quality_gate": True,
+                "order_count": 0,
+            }
+
+        filled = sum(1 for e in recent if e.get("new_status") == "filled")
+        cancelled = sum(1 for e in recent if e.get("new_status") == "canceled")
+
+        fill_ratio = filled / len(recent) if recent else 0.0
+        cancel_to_fill = cancelled / max(filled, 1)
+
+        # Phase 0 gates: 70% fill ratio and 2:1 cancel-to-fill ratio
+        passes = fill_ratio >= 0.70 and cancel_to_fill <= 2.0
+
+        return {
+            "fill_ratio": round(fill_ratio, 3),
+            "cancel_to_fill": round(cancel_to_fill, 3),
+            "passes_quality_gate": passes,
+            "order_count": len(recent),
+        }
 
     @staticmethod
     def _hold_minutes(entry_time: float, exit_time: Optional[float]) -> float:
@@ -268,7 +326,7 @@ class TradeAnalyticsJournal:
             "exit_breakdown": self._counter_list(e.get("exit_reason", "unknown") for e in final_exits),
             "asset_breakdown": self._asset_breakdown(final_exits),
             "order_status_breakdown": self._counter_list(e.get("new_status", "unknown") for e in order_statuses),
-            "top_failure_reasons": self._top_failure_reasons(order_statuses, final_exits),
+            "top_failure_reasons": self._top_failure_reasons(events, order_statuses, final_exits),
             "top_markets": self._top_markets(final_exits),
             "diagnostics": self._build_diagnostics(
                 final_exits=final_exits,
@@ -322,10 +380,16 @@ class TradeAnalyticsJournal:
 
     def _top_failure_reasons(
         self,
+        events: list[dict[str, Any]],
         order_statuses: list[dict[str, Any]],
         final_exits: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         counter: Counter[tuple[str, str]] = Counter()
+        for event in events:
+            if str(event.get("event") or "") == "orderbook_unavailable":
+                stage = str(event.get("stage") or "unknown")
+                err = str(event.get("error") or "orderbook unavailable").strip()
+                counter[("infra", f"{stage}: {err}")] += 1
         for event in order_statuses:
             new_status = str(event.get("new_status") or "")
             note = str(event.get("note") or "").strip()
